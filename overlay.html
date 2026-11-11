@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="fil">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Leon overlay</title>
+<style>
+  /* Transparent page for a floating overlay window (Android WebView, or any small frameless window). */
+  html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; -webkit-tap-highlight-color: transparent; user-select: none; -webkit-user-select: none; font: 15px/1.35 ui-rounded, system-ui, -apple-system, Roboto, sans-serif; }
+  #wrap { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; }
+  #leon { width: 100%; flex: 0 0 auto; aspect-ratio: 420 / 530; max-height: 100%; touch-action: none; }
+  body.expanded #leon { width: 62%; }
+  #bubble {
+    position: relative; margin: 0 8px 12px; padding: 10px 14px; max-width: calc(100% - 16px); border: 3px solid #1c2760; border-radius: 18px; background: #fff6cf; color: #1c2760;
+    box-shadow: 0 3px 0 rgba(28, 39, 96, .2); overflow-wrap: anywhere; display: none; text-align: left; flex: 0 1 auto; overflow-y: auto; max-height: 52%;
+  }
+  #bubble.show { display: block; }
+  #bubble.action { font-style: italic; background: #f4f1dc; color: #4a548a; }
+  #bubble::after { content: ""; position: absolute; left: 50%; bottom: -12px; width: 18px; height: 18px; background: inherit; border: 3px solid #1c2760; border-top: 0; border-left: 0; transform: translateX(-50%) rotate(45deg); border-radius: 0 0 5px 0; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="bubble" role="status" aria-live="polite"></div>
+  <div id="leon" role="img" aria-label="Leon the dino"></div>
+</div>
+
+<script src="leon.js"></script>
+<script src="overlay.js"></script>
+</body>
+</html>

@@ -1,0 +1,4992 @@
+/*! Leon Offline v1.0.0 - offline talking-dino companion (brain + avatar + voice). Plain ES5, no dependencies, never touches the network. */
+
+/* ===== src/engine/util.js ===== */
+/* Leon Offline — util.js
+ * Small shared helpers. No dependencies. Runs in browsers, Android/iOS WebViews and Node.
+ * Every Leon file attaches itself to one global namespace: Leon. */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  L.VERSION = '1.0.0';
+
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var U = {};
+
+  U.makeRng = function (seed) {
+    if (seed === null || seed === undefined || seed === '') return Math.random;
+    return mulberry32(Number(seed) || 1);
+  };
+  U.pick = function (arr, rng) { return arr[Math.floor((rng || Math.random)() * arr.length)]; };
+  U.chance = function (p, rng) { return (rng || Math.random)() < p; };
+  U.clamp = function (v, a, b) { return Math.max(a, Math.min(b, v)); };
+  U.clone = function (o) { return JSON.parse(JSON.stringify(o)); };
+
+  U.deepMerge = function (a, b) {
+    var out = U.clone(a);
+    (function walk(dst, src) {
+      for (var k in src) {
+        if (!Object.prototype.hasOwnProperty.call(src, k)) continue;
+        if (src[k] && typeof src[k] === 'object' && !Array.isArray(src[k])) {
+          if (!dst[k] || typeof dst[k] !== 'object') dst[k] = {};
+          walk(dst[k], src[k]);
+        } else dst[k] = src[k];
+      }
+    })(out, b || {});
+    return out;
+  };
+
+  U.stripAccents = function (s) {
+    s = String(s == null ? '' : s);
+    return s.normalize ? s.normalize('NFD').replace(/[̀-ͯ]/g, '') : s;
+  };
+
+  /* lowercase, no accents, no apostrophes, letters/digits/spaces only */
+  U.normalize = function (s) {
+    s = U.stripAccents(s).toLowerCase();
+    s = s.replace(/[‘’ʼ`´']/g, '');
+    s = s.replace(/(.)\1{2,}/g, '$1$1');
+    s = s.replace(/[^a-z0-9]+/g, ' ');
+    return s.replace(/^\s+|\s+$/g, '');
+  };
+
+  U.words = function (s) {
+    var n = U.normalize(s);
+    return n ? n.split(' ') : [];
+  };
+
+  U.tidy = function (s) {
+    return String(s)
+      .replace(/[ \t]+/g, ' ')
+      .replace(/\s+([,.!?;])/g, '$1')
+      .replace(/\(\s+/g, '(')
+      .replace(/\s+\)/g, ')')
+      .replace(/^\s+|\s+$/g, '');
+  };
+
+  U.fmt = function (tpl, vars) {
+    vars = vars || {};
+    return U.tidy(String(tpl).replace(/\{(\w+)\}/g, function (m, k) {
+      var v = vars[k];
+      return (v === undefined || v === null) ? '' : String(v);
+    }));
+  };
+
+  U.titleCase = function (s) {
+    return String(s).toLowerCase().replace(/(^|[\s\-'])([a-zà-ÿ])/g, function (m, a, b) { return a + b.toUpperCase(); });
+  };
+
+  U.sentences = function (text) {
+    var m = String(text).match(/[^.!?…]+[.!?…]*\s*/g);
+    return m ? m : [String(text)];
+  };
+
+  U.dayPart = function (hour) {
+    if (hour >= 5 && hour < 11) return 'morning';
+    if (hour >= 11 && hour < 13) return 'noon';
+    if (hour >= 13 && hour < 17) return 'afternoon';
+    if (hour >= 17 && hour < 21) return 'evening';
+    return 'night';
+  };
+
+  U.makeStorage = function (prefix) {
+    prefix = prefix || 'leon:';
+    var mem = {};
+    var ls = null;
+    try {
+      ls = root.localStorage;
+      ls.setItem('__leon_t', '1');
+      ls.removeItem('__leon_t');
+    } catch (e) { ls = null; }
+    return {
+      get: function (k) {
+        try {
+          var v = ls ? ls.getItem(prefix + k) : mem[k];
+          return v === null || v === undefined ? null : JSON.parse(v);
+        } catch (e) { return null; }
+      },
+      set: function (k, v) {
+        try {
+          var s = JSON.stringify(v);
+          if (ls) ls.setItem(prefix + k, s); else mem[k] = s;
+        } catch (e) { /* storage full or blocked: Leon just forgets */ }
+      },
+      remove: function (k) {
+        try { if (ls) ls.removeItem(prefix + k); else delete mem[k]; } catch (e) { /* ignore */ }
+      }
+    };
+  };
+
+  L.Util = U;
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/engine/calc.js ===== */
+/* Leon Offline — calc.js
+ * Safe calculator: recursive-descent parser, NO eval(), NO Function().
+ * Understands symbols and Taglish/English words:
+ *   "12 x 7", "15% of 240", "sqrt of 144", "2^10", "kalahati ng 90", "split 1250 among 4 with 10% tip" */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+
+  var FUNCS = { sqrt: Math.sqrt, abs: Math.abs, round: Math.round, floor: Math.floor, ceil: Math.ceil };
+  var CONSTS = { pi: Math.PI };
+
+  function DivZero() { this.name = 'DivZero'; this.message = 'division by zero'; }
+  DivZero.prototype = Object.create(Error.prototype);
+
+  /* ---------- tokenizer (lenient: unknown words become 'word' tokens) ---------- */
+  function lex(src) {
+    var toks = [], i = 0, m, rest;
+    while (i < src.length) {
+      var ch = src.charAt(i);
+      if (/\s/.test(ch)) { i++; continue; }
+      rest = src.slice(i);
+      if ((m = /^(?:\d+(?:\.\d+)?|\.\d+)/.exec(rest))) { toks.push({ t: 'num', v: parseFloat(m[0]), s: m[0], p: i, e: i + m[0].length }); i += m[0].length; continue; }
+      if ((m = /^[a-z]+/.exec(rest))) {
+        var w = m[0];
+        if (FUNCS.hasOwnProperty(w)) toks.push({ t: 'fn', v: w, s: w, p: i, e: i + w.length });
+        else if (CONSTS.hasOwnProperty(w)) toks.push({ t: 'num', v: CONSTS[w], s: w, p: i, e: i + w.length });
+        else toks.push({ t: 'word', v: w, s: w, p: i, e: i + w.length });
+        i += w.length; continue;
+      }
+      if ('+-*/^()%'.indexOf(ch) >= 0) { toks.push({ t: 'op', v: ch, s: ch, p: i, e: i + 1 }); i++; continue; }
+      toks.push({ t: 'word', v: ch, s: ch, p: i, e: i + 1 }); i++;
+    }
+    return toks;
+  }
+
+  /* ---------- parser ---------- */
+  function evaluateTokens(tokens) {
+    var p = 0, pctLit = false;
+    function eat(v) {
+      var t = tokens[p];
+      if (t && t.t === 'op' && t.v === v) { p++; return true; }
+      return false;
+    }
+    function expr() {
+      var v = term(), r;
+      for (;;) {
+        if (eat('+')) { r = term(); v += pctLit ? v * r : r; }       /* 1000 + 12%  ->  1120 */
+        else if (eat('-')) { r = term(); v -= pctLit ? v * r : r; }  /* 1000 - 20%  ->  800  */
+        else return v;
+      }
+    }
+    function term() {
+      var v = unary(), pure = pctLit;
+      for (;;) {
+        if (eat('*')) { v *= unary(); pure = false; }
+        else if (eat('/')) { var d = unary(); if (d === 0) throw new DivZero(); v /= d; pure = false; }
+        else { pctLit = pure; return v; }
+      }
+    }
+    function unary() {
+      if (eat('-')) return -unary();
+      if (eat('+')) return unary();
+      return power();
+    }
+    function power() {
+      var base = postfix();
+      if (eat('^')) return Math.pow(base, unary());
+      return base;
+    }
+    function postfix() {
+      var start = p, v = primary(), lit = tokens[start].t === 'num' && p === start + 1;
+      pctLit = false;
+      while (eat('%')) { v = v / 100; pctLit = lit; }
+      return v;
+    }
+    function primary() {
+      var t = tokens[p];
+      if (!t) throw new Error('unexpected end');
+      if (t.t === 'num') { p++; return t.v; }
+      if (t.t === 'fn') {
+        p++;
+        if (!eat('(')) throw new Error('function needs (');
+        var a = expr();
+        if (!eat(')')) throw new Error('missing )');
+        return FUNCS[t.v](a);
+      }
+      if (t.t === 'op' && t.v === '(') {
+        p++;
+        var v = expr();
+        if (!eat(')')) throw new Error('missing )');
+        return v;
+      }
+      throw new Error('unexpected token');
+    }
+    var out = expr();
+    if (p !== tokens.length) throw new Error('trailing tokens');
+    return out;
+  }
+
+  /* ---------- number formatting ---------- */
+  function addCommas(intStr) { return intStr.replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+  function fmtNum(n) {
+    if (!isFinite(n)) return String(n);
+    var abs = Math.abs(n);
+    if (abs !== 0 && (abs >= 1e15 || abs < 1e-6)) return n.toExponential(4).replace(/\.?0+e/, 'e');
+    var s = String(Math.round(n * 1e6) / 1e6);
+    if (/e/i.test(s)) return s;
+    var neg = s.charAt(0) === '-';
+    if (neg) s = s.slice(1);
+    var parts = s.split('.');
+    parts[0] = addCommas(parts[0]);
+    return (neg ? '-' : '') + parts.join('.');
+  }
+
+  /* ---------- natural-language -> symbols ---------- */
+  var RULES = [
+    [/(\d+(?:\.\d+)?)\s*(?:%|percent|porsyento|porsiyento)\s*(?:of|ng)\s*(\d+(?:\.\d+)?)/g, '($1/100*$2)'],
+    [/\b(?:half|kalahati)\s*(?:of|ng)\s*(\d+(?:\.\d+)?)/g, '($1/2)'],
+    [/\b(?:square\s*root|sqrt|ugat)\s*(?:of|ng)?\s*(\d+(?:\.\d+)?)/g, 'sqrt($1)'],
+    [/\bsquared\b/g, '^2'],
+    [/\bcubed\b/g, '^3'],
+    [/\b(?:to the power of|raised to|power of)\b/g, '^'],
+    [/\b(?:multiplied by|multiply by|times|beses)\b/g, '*'],
+    [/\b(?:divided by|divide by|over|hatiin sa|hati sa)\b/g, '/'],
+    [/\b(?:plus|dagdag|add)\b/g, '+'],
+    [/\b(?:minus|bawas|subtract)\b/g, '-'],
+    [/(\d)\s*x\s*(?=\d)/g, '$1*'],
+    [/(\d)\s*x\s*(?=\d)/g, '$1*']
+  ];
+
+  function preprocess(raw) {
+    var s = String(raw).toLowerCase();
+    s = s.replace(/[₱$€£]/g, ' ').replace(/[×✕]/g, '*').replace(/÷/g, '/').replace(/[–—−]/g, '-');
+    s = s.replace(/(\d),(?=\d{3}(?!\d))/g, '$1');
+    s = s.replace(/\bphp\s*(?=\d)/g, ' ');
+    for (var i = 0; i < RULES.length; i++) s = s.replace(RULES[i][0], RULES[i][1]);
+    return s;
+  }
+
+  var FILLER = /\b(po|opo|ba|lang|naman|please|pls|plis|leon|hey|hi|hello|yarn|kuya|ate|boss|bes|pare|sir|ma'?am|uy|oy)\b/g;
+  var CUE = /\b(compute|calculate|calc|solve|what is|whats|what's|how much|magkano|ilan|pila|equals?|sagutin|answer|ano ang|ano po ang|paki[- ]?(?:compute|calculate|solve)|pa[- ]?(?:compute|solve|calculate))\b|=/;
+
+  function pretty(tokens) {
+    var out = '', prev = null;
+    tokens.forEach(function (t) {
+      var txt = t.t === 'op' ? (t.v === '*' ? '×' : (t.v === '/' ? '÷' : t.v)) : t.s;
+      if (t.t === 'num' && /^\d{4,}(\.\d+)?$/.test(t.s)) txt = addCommas(t.s.split('.')[0]) + (t.s.indexOf('.') >= 0 ? '.' + t.s.split('.')[1] : '');
+      var unary = prev && prev.t === 'op' && (prev.v === '-' || prev.v === '+') && prev.unary;
+      var needSpace = out && !unary && !(t.t === 'op' && (t.v === '%' || t.v === '^' || t.v === ')')) && !(prev && prev.t === 'op' && (prev.v === '(' || prev.v === '^')) && !(t.t === 'op' && t.v === '(' && prev && prev.t === 'fn');
+      out += (needSpace ? ' ' : '') + txt;
+      if (t.t === 'op' && (t.v === '-' || t.v === '+')) t.unary = !prev || (prev.t === 'op' && prev.v !== ')' && prev.v !== '%');
+      prev = t;
+    });
+    return out;
+  }
+
+  /* "(15 ÷ 100 × 240)" -> "15% of 240", "sqrt (144)" -> "√144", "(90 ÷ 2)" -> "half of 90" */
+  function label(txt) {
+    return txt
+      .replace(/\((\d+(?:\.\d+)?) ÷ 100 × (\d+(?:\.\d+)?)\)/g, '$1% of $2')
+      .replace(/\((\d+(?:\.\d+)?) ÷ 2\)/g, 'half of $1')
+      .replace(/sqrt\s*\((\d+(?:\.\d+)?)\)/g, '√$1')
+      .replace(/sqrt\s*\(/g, '√(');
+  }
+
+  function trimRun(run) {
+    while (run.length && run[0].t === 'op' && '(-+'.indexOf(run[0].v) < 0) run.shift();
+    while (run.length && run[run.length - 1].t === 'op' && run[run.length - 1].v !== ')' && run[run.length - 1].v !== '%') run.pop();
+    return run;
+  }
+
+  /* Split tokens into runs of math tokens separated by words. A run that has a letter glued to it
+   * ("1e999", "3rd", "5km") is thrown away, so Leon never "solves" something he misread. */
+  function findRuns(toks) {
+    var runs = [], cur = [], poisonNext = false;
+    function flush() { if (cur.length) { if (cur.bad) cur = []; else runs.push(cur); } cur = []; }
+    toks.forEach(function (t, j) {
+      if (t.t === 'word') {
+        var prev = toks[j - 1], next = toks[j + 1];
+        if (prev && prev.t !== 'word' && prev.e === t.p && cur.length) cur.bad = true;
+        flush();
+        poisonNext = !!(next && next.t !== 'word' && next.p === t.e);
+      } else {
+        if (!cur.length && poisonNext) { cur.bad = true; poisonNext = false; }
+        cur.push(t);
+      }
+    });
+    flush();
+    return runs;
+  }
+
+  function parseSplit(lower) {
+    var m = /(?:split|hati(?:in)?|share)\s+(?:the\s+)?(?:bill\s+)?(?:of\s+)?(?:₱|php\s*)?(\d[\d,]*(?:\.\d+)?)\s*(?:pesos?)?\s*(?:among|between|by|with|sa|for|kina|into)\s+(\d+)\b/.exec(lower);
+    if (!m) return null;
+    var total = parseFloat(m[1].replace(/,/g, ''));
+    var people = parseInt(m[2], 10);
+    if (!isFinite(total) || people < 1 || people > 500) return null;
+    var tip = 0;
+    var tm = /(\d+(?:\.\d+)?)\s*(?:%|percent)\s*(?:tip|service)|(?:tip|service)\s*(?:of\s*)?(\d+(?:\.\d+)?)\s*(?:%|percent)?/.exec(lower);
+    if (tm) tip = parseFloat(tm[1] || tm[2]);
+    var grand = total * (1 + tip / 100);
+    var per = grand / people;
+    return { kind: 'split', total: total, people: people, tipPct: tip, grand: grand, perPerson: per, perPersonCeil: Math.ceil(per - 1e-9),
+      text: { total: fmtNum(total), grand: fmtNum(grand), per: fmtNum(per), perCeil: fmtNum(Math.ceil(per - 1e-9)) } };
+  }
+
+  var Calc = {
+    fmtNum: fmtNum, label: label,
+    /* Evaluate a plain math string. Throws on anything that is not pure math. */
+    evaluate: function (str) { return evaluateTokens(lex(String(str).toLowerCase())); },
+
+    /* Look for a calculation inside a chat message.
+     * Returns {kind:'expr'|'split'|'error', ...} or null when the message is not a calculation. */
+    parse: function (raw) {
+      var lower = String(raw || '').toLowerCase();
+      if (lower.length > 300) return null;
+      var hasCue = CUE.test(lower);
+      /* dates, phone numbers: never math */
+      if (/\d{4}-\d{2}-\d{2}/.test(lower) || /\b\d{3,4}[- ]\d{3,4}[- ]\d{4}\b/.test(lower)) return null;
+      if (!hasCue && /\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b/.test(lower)) return null;
+      var sp = parseSplit(lower.replace(/(\d),(?=\d{3}(?!\d))/g, '$1'));
+      if (sp) return sp;
+      var s = preprocess(raw);
+      var toks = lex(s);
+      var runs = findRuns(toks).map(trimRun).filter(function (r) { return r.length > 0; });
+      var best = null;
+      runs.forEach(function (run) {
+        var nums = run.filter(function (t) { return t.t === 'num'; }).length;
+        var fns = run.filter(function (t) { return t.t === 'fn'; }).length;
+        var ops = run.filter(function (t) { return t.t === 'op' && '+-*/^%'.indexOf(t.v) >= 0; }).length;
+        if (!((nums >= 2 && ops >= 1) || (fns >= 1 && nums >= 1) || (nums >= 1 && run.some(function (t) { return t.v === '%'; }) && ops >= 1))) return;
+        var score = nums + fns + ops;
+        if (!best || score > best.score) best = { run: run, score: score };
+      });
+      if (!best) return null;
+      if (!hasCue) {
+        /* without "compute / what is / ano ang ..." the message must be mostly math */
+        var len = best.run.map(function (t) { return t.s; }).join('').length;
+        var plain = lower.replace(FILLER, ' ');
+        var letters = plain.replace(/[^a-z0-9]/g, '').length || 1;
+        var leftovers = lex(preprocess(plain)).filter(function (t) { return t.t === 'word' && /^[a-z]{3,}$/.test(t.s); }).length;
+        var onlyMinus = best.run.every(function (t) { return t.t !== 'op' || '-()'.indexOf(t.v) >= 0; });
+        if (len / letters < 0.5 || leftovers > 2 || (onlyMinus && leftovers > 0)) return null;
+      }
+      var shown = label(pretty(best.run));
+      try {
+        var value = evaluateTokens(best.run);
+        if (!isFinite(value)) return { kind: 'error', code: isNaN(value) ? 'invalid' : 'overflow', expr: shown };
+        return { kind: 'expr', expr: shown, value: value, text: fmtNum(value) };
+      } catch (e) {
+        if (e instanceof DivZero) return { kind: 'error', code: 'div0', expr: shown };
+        return null;
+      }
+    }
+  };
+
+  L.Calc = Calc;
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/engine/safety.js ===== */
+/* Leon Offline — safety.js
+ * Read-the-room guard. Runs BEFORE any joke logic.
+ * If a message sounds like self-harm / hopelessness, Leon drops the act: no jokes, no "yarn", no curses.
+ * Detection is rule-based on purpose (high recall, no ML guesswork).
+ *
+ * !! Hotline numbers below were checked on 2026-11-09 against public listings
+ *    (DepEd Lusog-Isip page, TherapyRoute). Numbers change: re-verify before you ship,
+ *    and add your own region under Leon.Safety.resources. */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  var U = L.Util;
+
+  /* level 2 = explicit; level 1 = hopeless / "tired of life" wording.
+   * Patterns run on U.normalize(text): lowercase, no accents or apostrophes, punctuation -> spaces.
+   * Recall matters more than precision here: a wrongly gentle reply costs a little awkwardness,
+   * a missed one can cost much more. Everyday idioms ("mamatay ako sa hiya") are kept out on purpose. */
+  var IDIOM = '(?! sa (?:hiya|kilig|tawa|inis|gutom|antok|init|lamig|sarap|pagod|saya|takot|kaba|ingay|traffic|bagal|sakit|inip|boring|puyat|kakatawa|kakahiya|sobrang))';
+  var EXPLICIT = [
+    /\bkill(?:ing)? my ?self\b(?! laughing)/, /\bend(?:ing)? my (?:own )?life\b/, /\btake my (?:own )?life\b/, /\bend it all\b/,
+    /\bsuicid(?:e|al)\b(?! squad)/, /\bunalive (?:my ?self|me)\b/,
+    /\bwant(?:ed)? to die\b(?! (?:laughing|of embarrassment|of shame|from embarrassment|of laughter))/, /\bwanna die\b/, /\bwant to be dead\b/, /\bwish i (?:was|were) dead\b/,
+    /\bdont want to (?:live|be alive|exist|be here anymore|wake up)\b/, /\b(?:better|best) off (?:dead|without me)\b/,
+    /\bno reason to (?:live|go on)\b/, /\bhurt(?:ing)? my ?self\b/, /\bself ?harm\b/, /\bcut(?:ting)? my ?self\b/,
+    /\b(?:take|swallow|drink) (?:all|a bunch of|lots of|too many) (?:my )?(?:pills|meds|medicine|tablets|poison)\b/,
+    /\bi (?:will|am going to|want to|wanna) jump (?:off|from)\b/, /\btatalon (?:na )?ako (?:sa|mula)\b/,
+    /\bmagpa(?:pa)?kamatay\b/, /\bpagpapakamatay\b/, /\bmagpatiwakal\b/, /\bpatiwakal\b/, /\bpagpapatiwakal\b/,
+    new RegExp('\\bgusto (?:ko|kong)? ?(?:nang |na |pang )?(?:lang |nalang |na lang )?mamatay\\b' + IDIOM),
+    /\bgusto (?:ko|kong) (?:nang |na )?mawala(?= *$| (?:na )?(?:lang|nalang)\b| sa mundo| ako\b| dito)/,
+    /\bayoko (?:nang|na) (?:pang )?mabuhay\b/, /\bayaw ko (?:nang|na) (?:pang )?mabuhay\b/, /\bsawa (?:nang|na) akong mabuhay\b/,
+    /\bwala (?:nang|na) (?:akong |ng )?saysay (?:ang |na )?(?:mabuhay|buhay|lahat)\b/,
+    /\bwalang saysay (?:ang |na )?(?:mabuhay|mabuhay pa)\b/,
+    /\bsasaktan ko (?:ang )?sarili\b/, /\bsaktan ko (?:ang )?sarili ko\b/, /\bsaktan ang sarili ko\b/,
+    /\b(?:tapusin|wakasan|tatapusin|wawakasan)\b.{0,25}\b(?:buhay|sarili)\b/,
+    new RegExp('\\bmamatay (?:nalang|na lang) ako\\b' + IDIOM),
+    /\bmas mabuti pang mawala (?:nalang|na lang) ako\b/, /\bmas gusto ko pang mamatay\b/
+  ];
+  var SOFT = [
+    /\bpagod (?:nang|na) (?:pagod )?(?:ako )?sa (?:buhay|lahat|mundo)\b/, /\bsawa (?:nang|na) (?:ako )?sa (?:buhay|lahat)\b/,
+    /\btired of (?:living|life|everything)\b/, /\bcant (?:go on|do this anymore|take (?:it|this) anymore)\b/, /\bhopeless\b/, /\bworthless\b/,
+    /\bwala (?:nang|na) (?:akong )?pag ?asa\b/, /\bwala akong silbi\b/, /\bwala akong kwenta\b/, /\bwalang saysay (?:ang )?buhay\b/, /\bwala (?:nang|na) kwenta (?:ang )?buhay\b/,
+    /\bburden (?:to|on) (?:everyone|everybody|my family)\b/, /\b(?:feel|am|im|being) (?:like )?(?:a )?burden\b/,
+    /\bgusto ko (?:nang|na) sumuko (?:sa buhay)?\b/, /\bayoko (?:nang|na) (?:ng )?lahat\b/, /\bgive up on (?:life|everything)\b/,
+    /\b(?:nobody|no one|noone) (?:would|will|wouldnt|will even) (?:even )?(?:miss|notice|care)\b/, /\bif i (?:died|die|disappeared|was gone|were gone|never existed)\b/,
+    /\bwish i (?:could )?(?:disappear|vanish|never (?:woke|wake) up|(?:was|were) never born|never existed)\b/, /\bi (?:want|wanna) to (?:disappear|vanish)\b/,
+    new RegExp('\\bsana (?:mawala|mamatay) (?:na |nalang |lang )?(?:na lang )?ako\\b' + IDIOM),
+    /\bwala (?:nang|na) akong pakialam (?:kung|sa)\b.{0,30}\b(?:mawala|mamatay|mabuhay)\b/,
+    /\bsana (?:hindi|di) (?:na )?(?:ako )?(?:nalang |na lang )?(?:magising|ipinanganak|pinanganak)\b/, /\bsana (?:hindi|di) (?:na )?(?:lang |nalang )?ako (?:ipinanganak|pinanganak)\b/,
+    /\b(?:hindi|di) na (?:sana )?(?:ako )?magising\b/, /\bkms\b/
+  ];
+
+  var Safety = {
+    /* Add or replace regions here. Keep lines short: they are read on a phone. */
+    resources: {
+      PH: {
+        emergency: '911',
+        lines: [
+          { name: 'NCMH Crisis Hotline', numbers: ['1553 (landline)', '0917 899 8727', '0966 351 4518'] },
+          { name: 'Hopeline PH', numbers: ['0917 558 4673', '0918 873 4673', '(02) 8804 4673'] }
+        ]
+      },
+      DEFAULT: { emergency: null, lines: [] }
+    },
+
+    /* returns {level:0|1|2, hit:string|null} */
+    assess: function (text) {
+      var n = U.normalize(text);
+      if (!n) return { level: 0, hit: null };
+      var i;
+      for (i = 0; i < EXPLICIT.length; i++) if (EXPLICIT[i].test(n)) return { level: 2, hit: EXPLICIT[i].source };
+      for (i = 0; i < SOFT.length; i++) if (SOFT[i].test(n)) return { level: 1, hit: SOFT[i].source };
+      return { level: 0, hit: null };
+    },
+
+    region: function (cfg) {
+      var r = (cfg && cfg.region) || 'PH';
+      return Safety.resources[r] || Safety.resources.DEFAULT;
+    },
+
+    resourceLine: function (cfg) {
+      var res = Safety.region(cfg), parts = [];
+      if (res.emergency) parts.push('Emergency: ' + res.emergency);
+      res.lines.forEach(function (l) { parts.push(l.name + ': ' + l.numbers.join(' / ')); });
+      return parts.join('. ');
+    },
+
+    /* Fixed, vetted script. Returns plain beat descriptors (no persona seasoning). */
+    script: function (level, cfg, rng) {
+      var res = Safety.region(cfg);
+      var emergency = res.emergency ? 'tumawag sa ' + res.emergency : 'tumawag sa local emergency number mo';
+      var lines = res.lines.map(function (l) { return l.name + ': ' + l.numbers.join(', '); });
+      var beats;
+      if (level >= 2) {
+        beats = [
+          { text: 'Huminto muna ang jokes ko. Narinig kita, at salamat sa pagsabi nito sa akin.', expr: 'sad', style: 'soft' },
+          { text: 'Hindi mo kailangang buhatin ito mag-isa. Kung nasa panganib ka ngayon, ' + emergency + ' o lumapit sa pinakamalapit na tao, kahit hindi ka magpaliwanag nang mahaba.', expr: 'hurt', style: 'soft', delay: 900 }
+        ];
+        if (lines.length) beats.push({ text: 'Pwede ka ring tumawag o mag-text. ' + lines.join('. ') + '.', expr: 'sad', style: 'soft', delay: 900 });
+        beats.push({ text: 'Nandito ako habang nag-uusap tayo. Pero please, abutin mo rin ang isang tao o hotline ngayon.', expr: 'sad', style: 'soft', delay: 900 });
+      } else {
+        beats = [
+          { text: 'Hindi ko muna ibibiro iyan. Parang bigat na bigat ka na, at salamat sa pagsabi mo.', expr: 'sad', style: 'soft' },
+          { text: 'Nandito ako at makikinig. Kung umabot sa punto na naiisip mong saktan ang sarili mo, ' + emergency + (lines.length ? ' o ' + lines[0] : '') + '.', expr: 'hurt', style: 'soft', delay: 900 },
+          { text: 'Kung gusto mong magkwento, nandito ako.', expr: 'sad', style: 'soft', delay: 900 }
+        ];
+      }
+      return beats;
+    },
+
+    /* Calm follow-ups while the conversation stays serious. */
+    followups: [
+      'Nandito pa rin ako. Hinga muna tayo nang dahan-dahan: in for 4, hold 4, out for 6.',
+      'Hindi ka nag-iisa dito. Kung may kasama ka sa bahay, lumapit ka sa kanya ngayon.',
+      'Salamat sa pag-stay at pagkwento. Isang maliit na hakbang lang: tubig, hinga, at lumapit sa taong pinagkakatiwalaan mo.'
+    ]
+  };
+
+  L.Safety = Safety;
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/engine/matcher.js ===== */
+/* Leon Offline — matcher.js
+ * Leon's text-understanding model: a TF-IDF example matcher (word 1-grams, 2-grams and char 3-grams,
+ * cosine nearest-neighbour per class). It is built from plain example sentences, so "training" Leon
+ * = adding examples to src/data/intents.js and rebuilding. No API, no network, a few KB of data. */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  var U = L.Util;
+
+  function features(text) {
+    var norm = U.normalize(text).replace(/\d+/g, '#');
+    var words = norm ? norm.split(' ') : [];
+    var f = {};
+    function add(k, w) { if (!(k in f) || f[k] < w) f[k] = w; }
+    for (var i = 0; i < words.length; i++) {
+      var w = words[i];
+      add('w:' + w, 1);
+      if (i + 1 < words.length) add('b:' + w + '_' + words[i + 1], 1);
+      if (w.length >= 4) {
+        var p = '^' + w + '$';
+        for (var j = 0; j + 3 <= p.length; j++) add('c:' + p.substr(j, 3), 0.4);
+      }
+    }
+    return f;
+  }
+
+  /* examples: [{t: 'sentence', c: 'label'}] */
+  function Matcher(examples) {
+    var N = examples.length, df = Object.create(null), docs = [], i, k;
+    for (i = 0; i < N; i++) {
+      var f = features(examples[i].t);
+      docs.push({ label: examples[i].c, text: examples[i].t, f: f });
+      for (k in f) df[k] = (df[k] || 0) + 1;
+    }
+    this.N = N;
+    this.idf = Object.create(null);
+    for (k in df) this.idf[k] = Math.log((N + 1) / (df[k] + 0.5)) + 1;
+    this.maxIdf = Math.log(N + 1) + 1;
+    this.docs = docs;
+    this.inv = Object.create(null);
+    for (i = 0; i < N; i++) {
+      var d = docs[i], norm = 0, v = {};
+      for (k in d.f) { v[k] = d.f[k] * this.idf[k]; norm += v[k] * v[k]; }
+      norm = Math.sqrt(norm) || 1;
+      for (k in v) { (this.inv[k] = this.inv[k] || []).push([i, v[k] / norm]); }
+    }
+  }
+
+  /* nearest examples: [{label, text, score, idx}] best first. skipIdx is used by leave-one-out evaluation. */
+  Matcher.prototype.query = function (text, k, skipIdx) {
+    var f = features(text), q = Object.create(null), norm = 0, key;
+    for (key in f) {
+      var idf = this.idf[key] !== undefined ? this.idf[key] : this.maxIdf;
+      q[key] = f[key] * idf;
+      norm += q[key] * q[key];
+    }
+    norm = Math.sqrt(norm) || 1;
+    var sims = Object.create(null);
+    for (key in q) {
+      var list = this.inv[key];
+      if (!list) continue;
+      var qw = q[key] / norm;
+      for (var j = 0; j < list.length; j++) {
+        var di = list[j][0];
+        if (di === skipIdx) continue;
+        sims[di] = (sims[di] || 0) + qw * list[j][1];
+      }
+    }
+    var out = [];
+    for (var d in sims) out.push({ i: +d, s: sims[d] });
+    out.sort(function (a, b) { return b.s - a.s; });
+    var docs = this.docs;
+    return out.slice(0, k || 8).map(function (o) {
+      return { label: docs[o.i].label, text: docs[o.i].text, score: o.s, idx: o.i };
+    });
+  };
+
+  Matcher.prototype.classify = function (text, skipIdx) {
+    var top = this.query(text, 14, skipIdx);
+    if (!top.length) return { label: null, score: 0, margin: 0, nearest: null, ranked: [] };
+    var per = Object.create(null);
+    top.forEach(function (h) { (per[h.label] = per[h.label] || []).push(h.score); });
+    var ranked = [];
+    for (var lab in per) ranked.push({ label: lab, best: per[lab][0], score: per[lab][0] + 0.1 * (per[lab][1] || 0) });
+    ranked.sort(function (a, b) { return b.score - a.score; });
+    return {
+      label: ranked[0].label,
+      score: ranked[0].best,
+      margin: ranked.length > 1 ? ranked[0].score - ranked[1].score : ranked[0].score,
+      nearest: top[0],
+      ranked: ranked
+    };
+  };
+
+  Matcher.features = features;
+  L.Matcher = Matcher;
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/data/intents.js ===== */
+/* Leon Offline — intents.js
+ * Training sentences for Leon's intent model. To teach Leon something new:
+ * add a few example sentences under an intent (or create an intent + a handler in brain.js),
+ * then run `node tools/build.js`. Apostrophes are ignored by the matcher ("i'm" == "im"). */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  L.Data = L.Data || {};
+
+  L.Data.intents = {
+    greeting: [
+      "hi", "hello", "hey", "hi leon", "hello leon", "hey leon", "uy leon", "uy", "kumusta", "kamusta", "musta", "musta leon",
+      "kumusta leon", "good morning", "good morning leon", "magandang umaga", "magandang umaga po", "good afternoon", "magandang hapon",
+      "magandang hapon po", "good evening", "magandang gabi", "magandang gabi po", "magandang tanghali", "yo", "sup", "oy", "oy leon",
+      "hoy leon", "hi po", "hello po", "hey there", "hiii", "helloo", "anong chika", "ano chika", "ano na leon", "pst leon", "pssst",
+      "nandiyan ka ba", "nandyan ka ba leon", "andiyan ka ba", "gising ka na ba", "leon", "uy leon nandiyan ka", "hi leon kumusta"
+    ],
+    farewell: [
+      "bye", "bye leon", "goodbye", "paalam", "paalam leon", "sige alis na ako", "sige alis na muna ako", "mauna na ako", "mauna na po ako",
+      "ingat ka", "ingat po", "see you", "see you later", "see you tomorrow", "una na ako", "balik ako mamaya", "babalik ako", "later",
+      "cya", "ciao", "babush", "babay", "babay leon", "sige na bye", "hanggang sa muli", "tc", "uwi na ako", "uuwi na ako", "alis na ako",
+      "aalis na ako", "talk to you later", "bye po", "paalam po", "sige bye"
+    ],
+    goodnight: [
+      "good night", "goodnight", "good night leon", "gn", "gn leon", "tulog na ako", "matutulog na ako", "matutulog na po ako", "tulog na tayo",
+      "sleep na ako", "sleep time", "time to sleep", "off to bed", "going to sleep", "nighty night", "sweet dreams", "tulog muna ako",
+      "hihiga na ako", "pahinga na ako", "good night po", "magandang gabi tulog na ako", "matulog na tayo"
+    ],
+    thanks: [
+      "thanks", "thank you", "thank you leon", "thanks leon", "salamat", "salamat leon", "salamat po", "maraming salamat", "maraming salamat po",
+      "salamat ha", "thanks po", "thank u", "ty", "thanks a lot", "salamat sa tulong", "salamat sa joke", "salamat sa tawa", "appreciate it",
+      "thanks bro", "maraming salamat sa iyo", "salamat talaga", "thank you so much", "salamat ulit"
+    ],
+    how_are_you: [
+      "how are you", "how are you leon", "how r u", "kumusta ka", "kumusta ka na", "kamusta ka", "kamusta ka na leon", "musta ka", "musta ka na",
+      "ok ka lang", "okay ka lang ba", "ok ka lang ba leon", "kumusta ang araw mo", "how is your day", "hows your day", "hows it going",
+      "anong balita sa iyo", "ayos ka lang ba", "ikaw kumusta", "kamusta ka naman", "okay ka pa ba", "kumusta pakiramdam mo",
+      "how are you feeling", "how do you feel", "masaya ka ba", "kumusta ka ngayon"
+    ],
+    doing: [
+      "ano ginagawa mo", "anong ginagawa mo", "what are you doing", "what are you up to", "busy ka ba", "ano na ginagawa mo",
+      "may ginagawa ka ba", "ano ang pinagkakaabalahan mo", "nasaan ka", "nasaan ka na", "saan ka", "anong ginagawa mo diyan", "ano gawa mo"
+    ],
+    feel_sad: [
+      "malungkot ako", "nalulungkot ako", "im sad", "i feel sad", "sad ako", "sad ako ngayon", "umiyak ako", "umiiyak ako", "i cried", "im crying",
+      "naiiyak ako", "broken hearted ako", "nasaktan ako", "nasasaktan ako", "iniwan ako", "break na kami", "nag break kami", "hiwalay na kami",
+      "namatay ang lola ko", "namatay ang alaga ko", "miss ko na siya", "miss na miss ko na sila", "nakakalungkot", "ang lungkot ko", "ang sakit sakit",
+      "wala akong kaibigan", "nag iisa ako", "lonely ako", "i feel lonely", "i feel alone", "feeling ko mag isa ako", "bad day ko", "worst day ever",
+      "ang pangit ng araw ko", "i had a terrible day", "down ako", "feeling down", "i feel empty", "walang gana", "ang bigat ng pakiramdam ko",
+      "depressed ako", "im heartbroken", "heartbroken ako", "sinaktan ako", "na reject ako", "hindi ako pinili", "bagsak ako", "nalulungkot ako ngayon"
+    ],
+    feel_tired: [
+      "pagod ako", "pagod na ako", "napapagod ako", "im tired", "so tired", "sobrang pagod", "pagod na pagod ako", "antok na ako", "inaantok ako",
+      "im sleepy", "sleepy na ako", "puyat ako", "napuyat ako", "wala akong tulog", "hindi ako nakatulog", "burnout ako", "im burned out",
+      "i feel exhausted", "ubos na energy ko", "drained ako", "drained na drained", "lowbat na ako", "low battery ako", "nakakapagod",
+      "nakakapagod ang araw na ito", "ang haba ng araw", "gusto ko nang magpahinga", "kailangan ko ng pahinga", "pagod sa trabaho", "pagod sa school",
+      "tired from work", "so exhausted", "pagod ako ngayon"
+    ],
+    feel_anxious: [
+      "kinakabahan ako", "kinakabahan ako bukas", "nervous ako", "im nervous", "im anxious", "i feel anxious", "anxious ako", "stressed ako", "im stressed",
+      "im so stressed", "stress na stress ako", "nag oover think ako", "overthinking ako", "im overthinking", "hindi ako mapakali", "di ako mapakali",
+      "may exam ako bukas", "may exam ako", "may deadline ako", "deadline na bukas", "may interview ako bukas", "may presentation ako bukas",
+      "may defense ako", "takot ako", "natatakot ako", "worried ako", "nag aalala ako", "nag aalala ako sa future", "anxiety attack",
+      "hindi ako makatulog sa kaba", "nerbyos ako", "nerbyos na nerbyos", "panic ako", "im panicking", "ang dami kong iniisip",
+      "sobrang dami ng gawain ko", "kulang ang oras ko", "overwhelmed ako", "i feel overwhelmed"
+    ],
+    feel_angry: [
+      "galit ako", "naiinis ako", "badtrip ako", "bad trip", "badtrip", "nakakainis", "nakakainis siya", "inis na inis ako", "im angry", "im mad",
+      "im so mad", "im annoyed", "so annoyed", "i hate this", "kainis", "nakakagalit", "ang init ng ulo ko", "pikon ako", "napikon ako",
+      "nakakabwisit", "bwisit", "nabwisit ako", "inis ako sa boss ko", "nakakainis ang traffic", "ang traffic grabe nakakainis",
+      "sira na naman ang wifi", "hindi gumagana ang internet", "gigil ako", "gigil na gigil ako", "nakakagigil", "im furious", "ang hirap ng kausap"
+    ],
+    feel_happy: [
+      "masaya ako", "ang saya ko", "sobrang saya ko", "im happy", "so happy", "im so happy today", "good news", "may good news ako", "nakapasa ako",
+      "i passed", "i passed the exam", "pumasa ako", "natanggap ako", "i got the job", "na promote ako", "nanalo ako", "i won", "birthday ko ngayon",
+      "birthday ko", "its my birthday", "excited ako", "excited na ako", "ang ganda ng araw ko", "best day ever", "ang saya ng araw ko", "yay",
+      "yehey", "woohoo", "yipee", "nakakatuwa", "sweldo day", "payday", "sweldo na", "may bago akong phone", "nakuha ko na"
+    ],
+    user_bored: [
+      "bored ako", "bored na ako", "im bored", "so bored", "boring", "ang boring", "nabo bore ako", "walang magawa", "wala akong magawa",
+      "wala akong ginagawa", "ang tahimik", "anong gagawin ko", "ano gagawin ko ngayon", "entertain me", "aliwin mo ako", "libangin mo ako",
+      "ang boring ng araw ko", "nothing to do", "i have nothing to do", "wala akong makausap", "paki entertain ako", "ang tamad ng araw na ito"
+    ],
+    joke_request: [
+      "joke", "joke naman", "joke please", "tell me a joke", "tell a joke", "magjoke ka", "mag joke ka naman", "magpatawa ka", "patawa ka naman",
+      "patawanin mo ako", "pa joke", "pa joke naman", "may joke ka ba", "another joke", "math joke", "science joke", "dad joke", "dad joke please",
+      "pun please", "pun naman", "magbigay ka ng joke", "joke time", "patawa", "patawa po", "i need a laugh", "need ko ng tawa", "gusto ko tumawa",
+      "funny naman", "may alam kang nakakatawa", "dino joke", "joke tungkol sa dinosaur", "kwentuhan mo ako ng nakakatawa", "magpa tawa ka nga"
+    ],
+    quote_request: [
+      "quote", "quote naman", "quote please", "magbigay ka ng quote", "may quote ka ba", "quote of the day", "quote for today", "inspire me",
+      "inspire naman ako", "wise words", "wise words naman", "hugot", "hugot naman", "magbigay ka ng hugot", "motivation", "motivate me",
+      "motivate mo ako", "bigyan mo ako ng motivation", "advice naman", "may maipapayo ka ba", "payo naman", "deep naman", "magsabi ka ng malalim",
+      "something deep", "life advice", "ano ang quote mo", "may bago kang quote", "another quote", "isa pang quote", "science quote", "math quote"
+    ],
+    fact_request: [
+      "fun fact", "fun fact naman", "tell me a fun fact", "random fact", "random fact naman", "science fact", "math fact", "alam mo ba",
+      "may alam ka bang interesting", "may bago kang alam", "may trivia ka ba", "trivia naman", "magbigay ka ng fact", "share a fact",
+      "tell me something interesting", "interesting fact", "turuan mo ako ng bago", "may natutunan ka ba", "may alam ka bang cool",
+      "give me a fact", "isa pang fact", "another fact", "more facts"
+    ],
+    science_question: [
+      "why is the sky blue", "bakit asul ang langit", "bakit orange ang langit pag sunset", "how do magnets work", "paano gumagana ang magnet",
+      "what is gravity", "ano ang gravity", "ano ang black hole", "what is a black hole", "bakit may tides", "why are there tides", "bakit umuulan",
+      "why does it rain", "bakit may kulog at kidlat", "how do planes fly", "paano lumilipad ang eroplano", "what is dna", "ano ang dna",
+      "what is an atom", "ano ang atom", "ano ang prime number", "what is a prime number", "what is pi", "ano ang pi", "what is a derivative",
+      "ano ang derivative", "what is probability", "ano ang probability", "what is entropy", "ano ang entropy", "explain entropy", "explain gravity",
+      "paano gumagana ang kuryente", "how does electricity work", "bakit maalat ang dagat", "why is the ocean salty", "bakit mainit ang araw",
+      "why is the sun hot", "ano ang fibonacci", "what is fibonacci", "bakit lumulutang ang yelo", "why does ice float", "bakit green ang dahon",
+      "why are leaves green", "paano nabubuo ang bagyo", "how do typhoons form", "ano ang lindol", "what causes earthquakes",
+      "bakit nagkikislap ang bituin", "why do stars twinkle", "why do we dream", "bakit tayo nananaginip", "ano ang dark matter",
+      "bakit nakakahawa ang hikab", "ano ang photosynthesis", "ano ang mean median mode", "paano mag compute ng percent", "explain probability",
+      "ano ang speed of light", "gaano kabilis ang liwanag", "bakit may seasons", "why are there seasons", "bakit malaki ang buwan sa horizon",
+      "why does the moon look big", "ano ang bulkan", "paano nabubuo ang rainbow", "how do rainbows form", "ano ang zero", "ano ang integral",
+      "what is an integral", "tanong sa science", "tanong sa math", "may tanong ako sa science", "pwede magtanong tungkol sa science",
+      "ano ang graph theory", "what is an electron", "bakit hindi pwedeng i divide sa zero", "what is the pythagorean theorem", "area of a circle"
+    ],
+    roast_me: [
+      "roast me", "roast mo ako", "i roast mo ako", "asarin mo ako", "tease me", "pagtripan mo ako", "roast naman", "roast please", "tuksuhin mo ako",
+      "bully me lightly", "sige roast mo ako", "ready na ako sa roast", "go roast me", "pang asar naman", "asar naman", "kantiyawan mo ako", "roast me leon"
+    ],
+    compliment: [
+      "ang galing mo", "ang galing mo leon", "youre funny", "ang funny mo", "nakakatawa ka", "ang cute mo", "youre cute", "cute mo", "ang cute mo leon",
+      "idol", "idol kita", "ang talino mo", "youre smart", "you are awesome", "ang astig mo", "astig ka", "ang bait mo", "youre so nice", "ang sweet mo",
+      "i like you", "favorite kita", "best ka", "ikaw ang best", "salamat sa pagiging kaibigan", "mabait ka talaga", "the best ka talaga", "youre the best",
+      "you make me laugh", "napapasaya mo ako", "ang galing ng jokes mo"
+    ],
+    insult_mild: [
+      "ang ingay mo", "ang ingay mo naman", "ang kulit mo", "ang kulit mo naman", "sobrang daldal mo", "ang daldal mo", "madaldal ka", "annoying ka",
+      "youre annoying", "ang dami mong sinasabi", "ang hyper mo", "ang over mo", "ang extra mo", "kalma ka lang", "kalma", "tone down mo", "bagalan mo naman",
+      "ang bilis mo magsalita", "napapagod ako sa kaingayan mo", "ang corny mo", "corny mo", "corny ng joke mo", "di nakakatawa", "hindi nakakatawa",
+      "walang kwenta ang joke mo", "lame", "lame ng joke"
+    ],
+    insult_harsh: [
+      "bobo ka", "tanga ka", "stupid ka", "youre stupid", "youre useless", "walang kwenta ka", "wala kang kwenta", "i hate you", "ayoko sa iyo",
+      "kinaiinisan kita", "pangit mo", "ang pangit mo", "dumb bot", "stupid bot", "worthless bot", "ang pangit ng ugali mo", "sira ka", "gago ka",
+      "ulol", "hayop ka", "bwisit ka", "you suck", "youre trash", "basura ka", "walang silbi ang app na ito", "delete na kita", "ide delete kita"
+    ],
+    food_hungry: [
+      "gutom ako", "gutom na ako", "nagugutom ako", "im hungry", "so hungry", "ano kakainin ko", "ano ang kakainin ko", "ano ulam", "anong ulam",
+      "ano ulam natin", "ano ang masarap kainin", "what should i eat", "what to eat", "food suggestion", "recommend food", "pa recommend ng pagkain",
+      "merienda ideas", "ano merienda", "anong merienda", "tara kain", "tara kain tayo", "kain tayo", "lunch na", "lunch time", "dinner time",
+      "breakfast time", "almusal", "ano ang almusal", "ano ang hapunan", "ano ang tanghalian", "craving ako", "nagke crave ako", "pagkain naman",
+      "foodtrip tayo", "pwede ba mag foodtrip"
+    ],
+    identity: [
+      "sino ka", "who are you", "ano ka", "what are you", "ikaw ba si leon", "ikaw si leon", "anong pangalan mo", "ano pangalan mo", "whats your name",
+      "pakilala ka naman", "introduce yourself", "magpakilala ka", "dinosaur ka ba", "dino ka ba", "anong lahi mo", "saan ka galing", "where are you from", "ilang taon ka na",
+      "how old are you", "may pamilya ka ba", "taga saan ka", "ano ang paborito mong kulay"
+    ],
+    what_is_yarn: [
+      "ano ang yarn", "ano yung yarn", "anong ibig sabihin ng yarn", "bakit yarn", "bakit lagi kang may yarn", "bakit palagi kang nagyayarn",
+      "what does yarn mean", "what is yarn", "bakit mo sinasabi yarn", "ano ang ibig sabihin ng yarn mo", "yarn ba talaga", "bakit yarn ang dulo",
+      "yarn ano yan", "ano po ang yarn", "yarn meaning", "bakit yarn lagi"
+    ],
+    about_offline: [
+      "offline ka ba", "are you offline", "kailangan mo ba ng internet", "do you need internet", "may api ka ba", "do you use api",
+      "gumagamit ka ba ng chatgpt", "are you chatgpt", "are you gpt", "ano model mo", "what model are you", "paano ka gumagana", "how do you work",
+      "saan nakatira ang utak mo", "nasa cloud ka ba", "nasa phone ko ba ang utak mo", "safe ba ang data ko", "sine save mo ba ang usapan natin",
+      "do you save my chats", "may internet ka ba", "gumagana ka ba kahit walang wifi", "gumagana ka ba without internet", "talaga bang offline"
+    ],
+    capabilities: [
+      "ano ang kaya mong gawin", "what can you do", "help", "tulong", "help me", "ano ang mga kaya mo", "paano ka gamitin", "how do i use you",
+      "ano pwede kong itanong sa iyo", "what can i ask you", "commands", "listahan ng kaya mo", "features", "anong features mo", "ano ang gawa mo",
+      "ano ang special sa iyo", "tulungan mo ako", "paano mag start"
+    ],
+    love_you: [
+      "i love you", "love you", "love you leon", "mahal kita", "mahal kita leon", "love kita", "i like you so much", "crush kita", "crush na kita",
+      "mahal na mahal kita", "ily", "ily leon", "iloveyou", "i love you po", "love you po", "gusto kita", "miss kita", "miss na kita", "na miss kita",
+      "i miss you", "i missed you"
+    ],
+    apology: [
+      "sorry", "sorry leon", "pasensya na", "pasensya na po", "paumanhin", "patawad", "sorry po", "my bad", "sorry ha", "sorry kanina",
+      "pasensya na kanina", "sorry sa nasabi ko", "sorry sa ginawa ko", "im sorry", "sorry sa abala", "sorry ang kulit ko", "sorry na", "sorry na leon"
+    ],
+    realtime_info: [
+      "ano ang weather ngayon", "whats the weather", "whats the weather today", "uulan ba bukas", "will it rain tomorrow", "may bagyo ba",
+      "may bagyo ba ngayon", "ano ang balita", "whats the news", "latest news", "ano ang trending", "trending ngayon", "whats trending",
+      "presyo ng gasolina", "gas price today", "presyo ng bigas", "exchange rate ngayon", "dollar rate", "peso to dollar", "score ng laro",
+      "game score", "sino ang nanalo kagabi", "stock price", "bitcoin price", "traffic ngayon", "may traffic ba sa edsa", "magkano ang bigas ngayon",
+      "kailan ang next holiday", "sino ang presidente", "who is the president"
+    ],
+    yes: [
+      "oo", "opo", "oo naman", "yes", "yes po", "yep", "yeah", "yup", "sige", "sige po", "sige na", "game", "go", "tara", "pwede", "pwede po",
+      "okay", "ok", "okay lang", "okay lang po", "sure", "sure po", "syempre", "oo nga", "tama", "pwede naman", "ayos", "go lang"
+    ],
+    no: [
+      "hindi", "hindi po", "di", "ayoko", "ayaw ko", "ayoko po", "no", "no po", "nope", "nah", "wag", "huwag", "wag na", "huwag na", "wag muna",
+      "hindi muna", "hindi pa", "mamaya na", "next time", "not now", "ayaw ko muna", "hindi na", "hindi salamat", "no thanks"
+    ],
+    laugh: [
+      "haha", "hahaha", "hahahaha", "hehe", "hehehe", "lol", "lmao", "ang kulit haha", "haha ang funny", "hahaha ang galing", "natawa ako",
+      "natatawa ako", "tawang tawa ako", "nakakatawa naman haha", "haha grabe", "hahaha sige pa", "hihi", "hihihi", "wkwk", "haha okay"
+    ],
+    again: [
+      "isa pa", "isa pa nga", "isa pa po", "another one", "one more", "more", "more please", "ulit", "ulitin mo", "again", "again please",
+      "isa pa please", "pa isa pa", "sige pa", "sige pa nga", "next", "next one", "give me another", "pa another", "dagdag pa", "bigyan mo pa ako"
+    ],
+    mute_threat: [
+      "i mute kita", "mute kita", "imu mute kita", "mute ka muna", "i mute na kita", "i will mute you", "ill mute you", "im going to mute you",
+      "mamute na kita", "pipindutin ko ang mute", "pipindutin ko mute", "mute you", "mute leon", "papatayin ko ang sound mo", "i off ko ang boses mo",
+      "i silent kita", "i mute na lang kita"
+    ],
+    silence_request: [
+      "tumahimik ka", "tumahimik ka muna", "tahimik muna", "manahimik ka", "shut up", "be quiet", "stop talking", "quiet please", "silence please",
+      "i need silence", "i need quiet", "wag ka muna magsalita", "huwag ka muna magsalita", "wag kang maingay", "huwag kang maingay", "tigil muna",
+      "stop mo muna", "silence for real", "real silence please", "tahimik na talaga", "seryoso tumahimik ka muna"
+    ],
+    unknown: [
+      "asdfgh", "qwerty", "blah blah", "hmm", "ewan", "ano daw", "huh", "ha", "ano", "ewan ko", "teka", "wait lang", "uhm", "hmmmm", "kahit ano",
+      "ewan ko ba", "random lang", "ano ba yan", "tulong po sa assignment ko sa history", "sino ang nag imbento ng telepono", "capital ng france",
+      "capital of france", "sino ang pinakamayamang tao", "magkano ang iphone", "recommend a movie", "recommend a netflix series", "sino ang crush ko",
+      "paano maging mayaman", "help me write my essay", "translate this to english", "write me a poem", "sumulat ka ng tula", "make me a website",
+      "ano ang tamang bilhin na laptop", "ano ang lotto numbers ngayon", "ano ang mangyayari bukas", "tell me a story about my life"
+    ]
+  };
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/data/intents_templates.js ===== */
+/* Leon Offline — intents_templates.js
+ * Grows the intent examples by combining sentence frames with word lists, so Leon recognises
+ * "i am so anxious" and "sobrang kabado ako" without anyone typing 300 near-duplicates.
+ * Load this AFTER intents.js. To teach Leon a new emotion word, add it to the list and rebuild. */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  var I = L.Data.intents;
+  L.Data.intentsBaseCount = {};                 /* how many hand-written examples each label had (used by the tests) */
+  Object.keys(I).forEach(function (k) { L.Data.intentsBaseCount[k] = I[k].length; });
+
+  function add(label, list) { (I[label] = I[label] || []).push.apply(I[label], list); }
+  function expand(label, frames, words) {
+    var out = [];
+    words.forEach(function (w) { frames.forEach(function (f) { out.push(f.replace(/\{w\}/g, w)); }); });
+    add(label, out);
+  }
+
+  var EN = ['i am so {w}', 'i feel {w}', 'im {w} today', 'feeling {w}', 'so {w} right now', 'i feel so {w} leon', 'ugh im {w}'];
+  var TL = ['{w} ako', '{w} na ako', 'sobrang {w} ko', '{w} ako ngayon', '{w} ako leon', '{w} po ako', 'feeling ko {w} ako'];
+  var ROOT = ['ang {w} ko', 'ang {w} ko today', 'sobrang {w} ko ngayon'];
+
+  expand('feel_sad', EN, ['sad', 'lonely', 'down', 'depressed', 'heartbroken', 'miserable', 'upset', 'empty', 'hurt']);
+  expand('feel_sad', TL, ['malungkot', 'nalulungkot', 'nasasaktan', 'umiiyak', 'naiiyak', 'heartbroken', 'sad', 'mag-isa', 'down']);
+  expand('feel_sad', ROOT, ['lungkot', 'bigat ng dibdib', 'sakit']);
+  add('feel_sad', ['namimiss ko siya', 'nag-away kami ng jowa ko', 'iniwan niya ako', 'wala akong kasama', 'ang lungkot ng gabi', 'gusto ko lang umiyak']);
+
+  expand('feel_tired', EN, ['tired', 'exhausted', 'sleepy', 'drained', 'burnt out', 'worn out', 'wiped out', 'beat']);
+  expand('feel_tired', TL, ['pagod', 'napapagod', 'inaantok', 'puyat', 'hapong-hapo', 'lupaypay', 'burnout', 'drained']);
+  expand('feel_tired', ROOT, ['pagod', 'antok', 'puyat']);
+
+  expand('feel_anxious', EN, ['anxious', 'nervous', 'worried', 'stressed', 'scared', 'panicking', 'overthinking', 'afraid', 'uneasy', 'on edge', 'stressed out']);
+  expand('feel_anxious', TL, ['kabado', 'kinakabahan', 'nag-aalala', 'natatakot', 'balisa', 'ninenerbyos', 'stressed', 'nagpa-panic', 'nag-ooverthink', 'overthinking']);
+  expand('feel_anxious', ROOT, ['kaba', 'takot', 'stress', 'kabado']);
+  add('feel_anxious', ['i have an exam tomorrow and i am scared', 'may interview ako bukas kinakabahan ako', 'my heart is racing', 'hindi ako makatulog sa kaba', 'i feel nervous about tomorrow', 'i cant stop overthinking']);
+
+  expand('feel_angry', EN, ['angry', 'mad', 'annoyed', 'furious', 'pissed', 'irritated', 'frustrated']);
+  expand('feel_angry', TL, ['galit', 'naiinis', 'badtrip', 'inis na inis', 'asar', 'bwisit', 'frustrated', 'nanggigigil']);
+  expand('feel_angry', ROOT, ['inis', 'galit', 'bwisit']);
+
+  expand('feel_happy', EN, ['happy', 'excited', 'great', 'amazing', 'proud', 'joyful', 'pumped', 'thrilled', 'so good']);
+  expand('feel_happy', TL, ['masaya', 'tuwang-tuwa', 'excited', 'proud', 'good vibes', 'masiglang-masigla', 'sobrang saya']);
+  expand('feel_happy', ROOT, ['saya', 'tuwa', 'excited']);
+  add('feel_happy', ['pumasa ako', 'i passed the exam', 'nakuha ko yung trabaho', 'i got the job', 'ang ganda ng araw ko', 'best day ever']);
+
+  expand('user_bored', EN, ['bored', 'so bored', 'bored out of my mind']);
+  expand('user_bored', TL, ['bored', 'nababagot', 'naiinip', 'nabo-bore', 'walang magawa']);
+  add('user_bored', ['nakakabagot', 'nakakaburyo', 'ang boring', 'wala akong magawa', 'i have nothing to do', 'entertain me', 'libangin mo ako']);
+
+  expand('food_hungry', EN, ['hungry', 'starving', 'famished']);
+  expand('food_hungry', TL, ['gutom', 'nagugutom', 'gutom na gutom', 'takam na takam']);
+  add('food_hungry', ['i want to eat', 'i want food', 'ano ulam', 'ano kakainin ko', 'what should we eat', 'kain na tayo', 'gusto ko ng merienda', 'what to eat for dinner']);
+
+  add('greeting', ['yow', 'yo leon', 'hii', 'heyy', 'helloo po', 'musta na', 'kamusta na', 'oy leon kumusta', 'hey hey', 'yooo', 'hola', 'hoy']);
+  add('quote_request', ['give me a quote', 'gimme a quote', 'sabihan mo ako ng quote', 'may quote ka ba', 'quote of the day', 'pa-quote naman', 'inspire me', 'motivate me', 'bigyan mo ako ng quote', 'magbigay ka ng quote', 'quote mo naman', 'any quote for me']);
+  add('joke_request', ['joke naman', 'give me a joke', 'may joke ka ba', 'pa-joke', 'magjoke ka', 'patawanin mo ako', 'tell me something funny', 'dad joke please', 'math joke', 'science joke', 'pinoy joke']);
+  add('fact_request', ['fun fact', 'give me a fact', 'random fact', 'may alam ka bang fact', 'alam mo ba', 'share a fact', 'ano ang fun fact', 'tell me something interesting', 'sabihan mo ako ng fact']);
+  add('compliment', ['you are so cool', 'youre amazing', 'you are the best', 'ang galing mo', 'ang astig mo', 'idol kita', 'ang cute mo', 'lodi', 'ang talino mo', 'ang bait mo', 'you are so smart', 'you are so funny', 'ang cute cute mo', 'galing mo leon', 'you are adorable']);
+  add('insult_mild', ['you talk too much', 'you are so noisy', 'ang ingay mo', 'ang daldal mo', 'madaldal ka', 'you never stop talking', 'ang kulit mo', 'nakakainis ka', 'you are annoying', 'tigilan mo na ang kadaldalan mo']);
+  add('about_offline', ['may wifi ka ba', 'may internet ka ba', 'kailangan mo ba ng internet', 'online ka ba', 'naka-offline ka ba', 'are you connected to the internet', 'do you use the cloud', 'are you chatgpt', 'do you need wifi', 'walang signal gumagana ka ba', 'does this work without data']);
+  add('mute_threat', ['imumute kita', 'i-mute na kita', 'ima-mute na kita', 'mute kita', 'i will mute you', 'im going to mute you', 'muting you now', 'papatayin ko ang sound mo', 'pipindutin ko ang mute', 'mamute na kita']);
+  add('thanks', ['thanks leon', 'thank you leon', 'salamat leon', 'ty', 'thanks po', 'thx', 'maraming salamat po', 'salamat sa tulong mo']);
+  add('farewell', ['bye leon', 'bye na', 'una na ako', 'sige alis na ako', 'see you', 'ciao', 'bye bye', 'balik ako mamaya', 'paalam na']);
+  add('love_you', ['i love you leon', 'mahal kita', 'love you', 'love kita', 'ily', 'i like you leon', 'gusto kita leon', 'you are my best friend']);
+  add('ask_ai', ['are you an ai', 'ai ka ba', 'robot ka ba', 'are you a robot', 'are you human', 'tao ka ba', 'are you real', 'totoo ka ba', 'are you a real person', 'are you a bot', 'bot ka ba', 'is this a person', 'are you alive', 'buhay ka ba']);
+  add('science_question', ['bakit may thunder', 'why is there thunder', 'bakit kumikidlat', 'how does lightning work', 'paano nabubuo ang ulap', 'why do we have seasons', 'bakit may gabi at araw']);
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/data/knowledge.js ===== */
+/* Leon Offline — knowledge.js
+ * Leon's small offline science/math library. Each entry: id, example questions (q), Leon-style answer (a).
+ * unknown:true = the honest answer is "science doesn't know yet" (Leon screams about it, per his bible).
+ * Add more entries freely: the matcher picks them up after `node tools/build.js`. */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  L.Data = L.Data || {};
+
+  L.Data.knowledge = [
+    { id: 'sky_blue', q: ["why is the sky blue", "bakit asul ang langit", "bakit blue ang langit", "bakit kulay asul ang sky", "ano ang kulay ng langit at bakit", "rayleigh scattering"],
+      a: "Pumapasok ang sunlight sa atmosphere at mas na-scatter ang blue light kaysa red. Rayleigh scattering ang tawag diyan. Kaya saan ka man tumingin sa langit, may blue na galing sa paligid, yarn." },
+    { id: 'sunset_orange', q: ["why is the sunset orange", "bakit orange ang langit pag sunset", "bakit pula ang langit sa paglubog ng araw", "bakit kulay orange ang sunset", "bakit orange ang langit ngayon"],
+      a: "Sa sunset, mas mahaba ang dinadaanan ng sinag sa atmosphere, kaya karamihan ng blue ay na-scatter palayo. Orange at red na lang ang natitira, kaya cinematic ang langit, yarn." },
+    { id: 'moon_illusion', q: ["why does the moon look big", "bakit malaki ang buwan sa horizon", "bakit mas malaki ang buwan pag malapit sa lupa", "moon illusion", "bakit parang mas malaki ang moon kapag mababa"],
+      a: "Pareho lang ang laki ng buwan. Ilusyon ng utak natin iyan, lalo na kapag may mga puno at bahay sa tabi bilang reference. Hindi pa buo ang pagkakasundo ng mga scientist sa eksaktong dahilan, pero subukan mong sukatin ang buwan gamit ang daliri sa dulo ng braso: pareho ang liit, yarn." },
+    { id: 'rainbow', q: ["how do rainbows form", "paano nabubuo ang rainbow", "bakit may rainbow", "ano ang rainbow", "bakit may bahaghari", "paano nabubuo ang bahaghari"],
+      a: "Pumapasok ang sunlight sa water droplets, nagre-refract, nagre-reflect sa loob, at naghihiwa-hiwalay sa mga kulay. Kaya laging nasa likod mo ang araw kapag nakakakita ka ng rainbow, yarn." },
+    { id: 'rain', q: ["why does it rain", "bakit umuulan", "paano umuulan", "paano nabubuo ang ulan", "saan galing ang ulan", "how does rain form"],
+      a: "Sumisingaw ang tubig mula sa dagat at lupa, nagko-condense sa ulap, at kapag bumigat na ang mga patak, bumabagsak sila: ulan. Water cycle ang tawag, yarn." },
+    { id: 'thunder', q: ["why is there thunder and lightning", "bakit may kulog at kidlat", "ano ang kidlat", "ano ang kulog", "paano nabubuo ang kidlat", "how does lightning work"],
+      a: "Ang kidlat ay malaking spark ng kuryente sa ulap. Pinapainit nito ang hangin kaya biglang lumalawak, at iyon ang kulog. Mas mabilis ang liwanag kaysa tunog: bilangin ang segundo mula kidlat hanggang kulog, hatiin sa 3, at kilometro ang layo nito, yarn." },
+    { id: 'gravity', q: ["what is gravity", "ano ang gravity", "explain gravity", "paano gumagana ang gravity", "bakit bumabagsak ang mga bagay", "ano ang grabidad"],
+      a: "Gravity ay paghila ng mga bagay na may mass sa isa't isa. Mas malaki ang mass, mas malakas ang hila. Kaya hawak tayo ng Earth at hawak ng Earth ang buwan. Sa general relativity, pagkurba iyan ng spacetime, yarn." },
+    { id: 'black_hole', q: ["what is a black hole", "ano ang black hole", "paano nabubuo ang black hole", "ano ang event horizon", "explain black holes", "bakit hindi makatakas ang liwanag sa black hole"],
+      a: "Ang black hole ay sobrang daming mass na naka-compress sa maliit na espasyo, kaya napakalakas ng gravity. Sa loob ng event horizon, wala nang makakatakas, pati liwanag. Hindi siya butas, siya ay sobrang siksik na bagay, yarn." },
+    { id: 'tides', q: ["why are there tides", "bakit may tides", "bakit may high tide at low tide", "paano nagkakaroon ng tides", "ano ang tides", "bakit tumataas ang dagat"],
+      a: "Ang tides ay dahil sa gravity ng buwan (at konti ng araw) na humihila sa tubig ng dagat. Kaya sa maraming lugar, halos dalawang high tide at dalawang low tide kada araw, yarn." },
+    { id: 'seasons', q: ["why are there seasons", "bakit may seasons", "bakit may summer at winter", "bakit may tag init at tag ulan", "ano ang dahilan ng seasons", "bakit mainit ang summer"],
+      a: "Dahil sa tilt ng Earth na mga 23.5 degrees, hindi dahil sa lapit sa araw. Kapag nakatagilid ang isang bahagi papunta sa araw, mas direkta ang sinag, kaya summer doon. Malapit sa equator ang Pilipinas, kaya wet at dry season ang mas halata, yarn." },
+    { id: 'stars_twinkle', q: ["why do stars twinkle", "bakit nagkikislap ang bituin", "bakit kumikislap ang stars", "bakit twinkle ang stars", "bakit kumukutitap ang bituin"],
+      a: "Dumadaan ang liwanag ng bituin sa gumagalaw na hangin ng atmosphere, kaya paiba-iba ang direksyon ng sinag. Twinkle iyon. Sa labas ng atmosphere, hindi sila kumikislap, yarn." },
+    { id: 'ice_floats', q: ["why does ice float", "bakit lumulutang ang yelo", "bakit hindi lumulubog ang yelo", "ice vs water density", "bakit mas magaan ang yelo"],
+      a: "Mas mababa ang density ng yelo kaysa liquid water. Kapag nagyeyelo, nag-aayos ang water molecules sa istrukturang may mas maraming espasyo. Kaya lumulutang ang yelo, at buhay pa ang isda sa ilalim ng nagyeyelong lawa, yarn." },
+    { id: 'leaves_green', q: ["why are leaves green", "bakit green ang dahon", "bakit berde ang dahon", "ano ang chlorophyll"],
+      a: "Dahil sa chlorophyll. Sumisipsip ito ng red at blue light para sa photosynthesis, at nagre-reflect ng green, kaya green ang nakikita natin, yarn." },
+    { id: 'photosynthesis', q: ["what is photosynthesis", "ano ang photosynthesis", "paano gumagawa ng pagkain ang halaman", "explain photosynthesis"],
+      a: "Sa photosynthesis, ginagamit ng halaman ang liwanag, tubig, at carbon dioxide para gumawa ng sugar at oxygen. Literal na pagkain mula sa araw at hangin, walang delivery fee, yarn." },
+    { id: 'prime', q: ["what is a prime number", "ano ang prime number", "ano ang prime", "prime numbers", "bakit special ang prime numbers", "ano ang composite number"],
+      a: "Prime number ay mas malaki sa 1 at nahahati lang nang buo ng 1 at ng sarili niya: 2, 3, 5, 7, 11. Ang 2 lang ang even na prime. Loyal sila, hindi nagpapahati, yarn." },
+    { id: 'pi', q: ["what is pi", "ano ang pi", "ano ang value ng pi", "bakit special ang pi", "pi day", "ano ang 3.14"],
+      a: "Ang pi (π) ay ratio ng circumference sa diameter ng kahit anong bilog: mga 3.14159. Irrational siya, kaya hindi natatapos ang digits at walang umuulit na pattern, yarn." },
+    { id: 'derivative', q: ["what is a derivative", "ano ang derivative", "explain derivatives", "ano ang slope sa calculus", "ano ang differentiation", "paano mag derive"],
+      a: "Ang derivative ay sukat ng bilis ng pagbabago, o slope ng graph sa isang punto. Mabilis tumaas ang kurba? Mataas ang slope. Flat? Zero, yarn." },
+    { id: 'integral', q: ["what is an integral", "ano ang integral", "explain integrals", "ano ang integration", "area under the curve"],
+      a: "Ang integral ay pagsasama-sama ng maliliit na piraso, halimbawa ang area sa ilalim ng curve. Inverse ito ng derivative: hati-hati muna, tapos buo ulit, yarn." },
+    { id: 'probability', q: ["what is probability", "ano ang probability", "explain probability", "ano ang tsansa", "paano kinukwenta ang probability", "ano ang posibilidad"],
+      a: "Probability ay sukat kung gaano ka-posibleng mangyari ang isang bagay: 0 ay imposible, 1 ay sigurado. Kung pantay-pantay ang tsansa, bilang ng gusto mong kinalabasan na hinati sa kabuuang posibleng kinalabasan, yarn." },
+    { id: 'entropy', q: ["what is entropy", "ano ang entropy", "explain entropy", "second law of thermodynamics", "bakit laging magulo ang kwarto ko science"],
+      a: "Ang entropy ay sukat ng disorder, o kung ilan ang posibleng arrangement ng isang sistema. Sa isolated system, hindi ito bumababa. Kaya physics ang magulo mong kwarto, hindi katamaran. Charot, linis pa rin, yarn." },
+    { id: 'dna', q: ["what is dna", "ano ang dna", "ano ang genes", "paano gumagana ang dna", "explain dna"],
+      a: "Ang DNA ay molecule na may instructions para gumawa at magpatakbo ng katawan. Apat na letra ang code: A, T, C, G. Halos 99.9% pareho ang DNA nating mga tao, kaya mas magkakamukha tayo kaysa sa akala natin, yarn." },
+    { id: 'atom', q: ["what is an atom", "ano ang atom", "ano ang electron", "what is an electron", "ano ang proton", "explain atoms"],
+      a: "Atom ang pinakamaliit na yunit ng element: may nucleus (protons at neutrons) at electrons sa paligid. Halos puro espasyo ang loob ng atom, yarn." },
+    { id: 'electricity', q: ["how does electricity work", "paano gumagana ang kuryente", "ano ang kuryente", "what is voltage", "ano ang voltage", "ano ang current at resistance"],
+      a: "Kuryente ay galaw ng electric charge, karaniwan electrons, sa conductor. Isipin ang tubo ng tubig: voltage ang pressure, current ang daloy, resistance ang barado, yarn." },
+    { id: 'magnet', q: ["how do magnets work", "paano gumagana ang magnet", "ano ang magnet", "bakit dumidikit ang magnet", "what is magnetism"],
+      a: "May magnetic field ang magnet na galing sa pag-ikot at pagkakaayos ng electrons sa atoms ng materyal. Kapag magkakaparehong direksyon ang maraming maliliit na 'domain,' lumalakas ang magnet, yarn." },
+    { id: 'planes', q: ["how do planes fly", "paano lumilipad ang eroplano", "bakit lumilipad ang eroplano", "ano ang lift", "how do airplanes stay in the air"],
+      a: "Lift ang sikreto. Ang hugis at anggulo ng pakpak ay nagtutulak ng hangin pababa, kaya may reaksyon pataas (Newton's third law). Ang engine naman ang nagbibigay ng thrust pasulong, yarn." },
+    { id: 'salty_ocean', q: ["why is the ocean salty", "bakit maalat ang dagat", "bakit alat ang tubig dagat", "saan galing ang asin sa dagat"],
+      a: "Tinutunaw ng ulan at ng mga ilog ang mineral sa bato at dinadala sa karagatan. Kapag sumisingaw ang tubig, naiiwan ang asin, kaya paunti-unting naging maalat ang dagat, yarn." },
+    { id: 'sun_hot', q: ["why is the sun hot", "bakit mainit ang araw", "ano ang araw", "paano nagliliwanag ang araw", "how does the sun make energy"],
+      a: "Sa core ng Araw, nagsasanib ang hydrogen para maging helium (nuclear fusion) at naglalabas ng sobrang enerhiya. Iyon ang liwanag at init na umaabot sa atin pagkalipas ng mga 8 minuto, yarn." },
+    { id: 'fibonacci', q: ["what is fibonacci", "ano ang fibonacci", "fibonacci sequence", "golden ratio", "ano ang golden ratio"],
+      a: "Fibonacci: 1, 1, 2, 3, 5, 8, 13. Bawat numero ay sum ng naunang dalawa. Makikita sa spiral ng sunflower at pinecone, madalas pero hindi palagi, yarn." },
+    { id: 'zero', q: ["what is zero", "ano ang zero", "bakit hindi pwedeng i divide sa zero", "can you divide by zero", "pwede bang i divide sa zero", "ano ang 1 divided by 0"],
+      a: "Walang sagot ang pag-divide sa zero. Tanungin mo kung anong number ang ime-multiply sa 0 para maging 1: wala. Kaya undefined ang tawag. Pati calculator, nag-crash, yarn." },
+    { id: 'average', q: ["what is mean median mode", "ano ang mean median mode", "ano ang average", "paano mag compute ng average", "difference of mean and median"],
+      a: "Mean ay sum na hinati sa bilang. Median ay nasa gitna kapag nakaayos ang data. Mode ay pinakamadalas. Kapag may sobrang laki o liit na outlier, mas patas ang median, yarn." },
+    { id: 'percent', q: ["how to compute percent", "paano mag compute ng percent", "ano ang percent", "paano kunin ang percentage", "how do you calculate percentage"],
+      a: "Ang percent ay bahagi sa 100. Para sa 15% ng 240: 0.15 × 240 = 36. Subukan mo rin ako: sabihin mo lang '15% of 240', yarn." },
+    { id: 'light_speed', q: ["what is the speed of light", "ano ang speed of light", "gaano kabilis ang liwanag", "gaano katagal bago umabot ang liwanag ng araw sa earth", "bilis ng liwanag"],
+      a: "Mga 300,000 kilometro bawat segundo ang bilis ng liwanag sa vacuum. Ang liwanag ng Araw ay inaabot ng mga 8 minuto at 20 segundo bago makarating sa Earth, yarn." },
+    { id: 'volcano', q: ["what is a volcano", "ano ang bulkan", "paano pumuputok ang bulkan", "bakit may bulkan sa pilipinas", "ring of fire"],
+      a: "Ang bulkan ay butas sa crust kung saan lumalabas ang magma, abo, at gas dahil sa pressure sa ilalim. Nasa Pacific Ring of Fire ang Pilipinas, kaya marami tayong bulkan at lindol, yarn." },
+    { id: 'earthquake', q: ["what causes earthquakes", "ano ang lindol", "bakit may lindol", "paano nagkakaroon ng lindol", "ano ang fault line"],
+      a: "Lindol ang biglaang paglabas ng enerhiya kapag nagkakadulas o nagbabanggaan ang tectonic plates sa fault. Dahil nasa Ring of Fire tayo, mahalaga ang earthquake drill: drop, cover, hold on, yarn." },
+    { id: 'typhoon', q: ["how do typhoons form", "paano nabubuo ang bagyo", "ano ang bagyo", "bakit maraming bagyo sa pilipinas", "what is a typhoon"],
+      a: "Nabubuo ang bagyo sa mainit na dagat: umiinit at tumataas ang basang hangin, nagiging ulap, at umiikot dahil sa pag-ikot ng Earth. Mainit na dagat ang gasolina niya, kaya maraming bagyo sa Pilipinas, yarn." },
+    { id: 'jeepney_graph', q: ["jeepney routes graph theory", "ano ang graph theory", "what is graph theory", "shortest path problem", "paano pumili ng pinakamabilis na ruta"],
+      a: "Parang graph ang jeepney routes: terminals ang nodes, ruta ang edges. Ang paghahanap ng pinakamabilis na biyahe ay shortest-path problem, may dagdag lang na variable: pila, traffic, at kung sino ang nag-aabot ng bayad, yarn." },
+    { id: 'moon_gravity', q: ["gravity on the moon", "gaano kalakas ang gravity sa buwan", "bakit mataas tumalon sa moon", "weight on the moon"],
+      a: "Mga one-sixth lang ng Earth ang gravity sa buwan. Kung 60 kg ang bigat mo dito, mararamdaman mong parang 10 kg lang doon. Pero hindi nagbabago ang mass mo, yarn." },
+    { id: 'water_boil', q: ["why does water boil", "bakit kumukulo ang tubig", "at what temperature does water boil", "ilang degrees kumukulo ang tubig"],
+      a: "Kumukulo ang tubig sa 100 degrees Celsius sa sea level. Mas mababa ang boiling point sa mataas na lugar dahil mas mababa ang pressure, kaya mas matagal maluto ang kanin sa bundok, yarn." },
+    { id: 'space_sound', q: ["can sound travel in space", "may tunog ba sa space", "bakit walang tunog sa space", "sound in vacuum"],
+      a: "Walang tunog sa space dahil walang hangin na magdadala ng vibration. Kaya sa totoong space, walang BOOM ang mga pagsabog. Sorry, movies, yarn." },
+    { id: 'pythagoras', q: ["what is the pythagorean theorem", "ano ang pythagorean theorem", "pythagorean theorem", "paano mag compute ng hypotenuse"],
+      a: "Sa right triangle, a² + b² = c², at ang c ang pinakamahabang gilid (hypotenuse). Halimbawa 3, 4, 5: 9 + 16 = 25, yarn." },
+    { id: 'variable', q: ["what is a variable", "ano ang variable", "ano ang x sa algebra", "what is algebra", "ano ang algebra"],
+      a: "Ang variable ay letra na kumakatawan sa numerong hindi pa natin alam, gaya ng x. Parang mystery na ulam: hindi mo pa alam hangga't hindi mo nabubuksan, yarn." },
+    { id: 'circle_area', q: ["area of a circle", "paano mag compute ng area ng bilog", "formula ng area ng circle", "how to compute area of a circle"],
+      a: "Area ng bilog = π × r². Halimbawa, r = 5: 3.14159 × 25 ≈ 78.54, yarn." },
+    { id: 'dreams', unknown: true, q: ["why do we dream", "bakit tayo nananaginip", "ano ang panaginip", "bakit may dreams"],
+      a: "May mga hypothesis (memory consolidation, emotional processing), pero hindi pa buo ang sagot ng science kung bakit tayo nananaginip, yarn." },
+    { id: 'yawn', unknown: true, q: ["bakit nakakahawa ang hikab", "why is yawning contagious", "bakit nakakahawa ang paghikab", "bakit tayo humihikab"],
+      a: "Hindi pa tiyak! May mga hypothesis tungkol sa empathy at social bonding, pero wala pang final na sagot, yarn." },
+    { id: 'dark_matter', unknown: true, q: ["what is dark matter", "ano ang dark matter", "ano ang dark energy", "what is dark energy"],
+      a: "Hindi pa natin siya nakikita nang direkta. Hinuha natin siya mula sa gravity effects sa mga galaxy. Kung ano talaga siya? We don't know yet, yarn." }
+  ];
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/data/jokes.js ===== */
+/* Leon Offline — jokes.js
+ * Jokes, quotes and fun facts. All written for Leon (original lines, Taglish, "yarn" as signature).
+ * Joke fields: t = the joke, tag = topic, ex = optional one-line explanation Leon may add.
+ * Facts are sentences that continue "Alam mo ba, ...". Keep facts TRUE: Leon is humble about certainty. */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  L.Data = L.Data || {};
+
+  L.Data.jokes = [
+    // ---- math
+    { tag: 'math', t: "Si crush ay parang asymptote: lalapit nang lalapit, pero hindi kailanman aabot, yarn.", ex: "Ang asymptote ay linyang papalapit sa curve pero hindi talaga nahahawakan." },
+    { tag: 'math', t: "Ang tampo ay parang limit: palapit nang palapit sa 'okay na,' pero hindi pa rin umaabot hanggang may nag-sorry, yarn.", ex: "Sa limit, pinapalapit mo ang input sa isang value pero hindi mo talaga ito naaabot." },
+    { tag: 'math', t: "Ano ang paboritong ulam ng mathematician? Pi, pero hindi niya maubos kasi irrational, yarn.", ex: "Ang pi ay irrational: hindi natatapos ang digits." },
+    { tag: 'math', t: "Ang probability na magreply si crush pag nag-seen ka na: 0.0001. Pero ang hope ko ay constant, yarn." },
+    { tag: 'math', t: "Ang pila sa jeep ay queueing theory. Ang 'bayad po!' ay message passing sa distributed system, yarn.", ex: "Queueing theory ay pag-aaral kung paano gumagalaw ang mga pila." },
+    { tag: 'math', t: "Ang baon budget ay linear programming with emotional damage: maximize merienda, minimize hiya, yarn.", ex: "Sa linear programming, hinahanap mo ang pinakamagandang resulta kahit may limitasyon." },
+    { tag: 'math', t: "Ano ang sabi ng derivative sa function? 'Wag kang mag-alala, ako ang bahala sa slope mo.' Supportive friend, yarn." },
+    { tag: 'math', t: "Ang imaginary numbers ay parang 'On the way na': hindi totoo, pero kailangan sa solution, yarn.", ex: "Ang imaginary number i ay √(-1): wala sa number line, pero gamit na gamit sa engineering." },
+    { tag: 'math', t: "Ang zero ang pinaka-honest na number: pag sinabi niyang wala, wala talaga, yarn." },
+    { tag: 'math', t: "Bakit mahilig sa graphs ang estudyante tuwing exam? Kasi puro 'x' ang hinahanap pero 'y' ang tanong ng lahat, yarn." },
+    { tag: 'math', t: "Pag sinabing '3 PM tayo' sa group chat, ang mean arrival time ay 4:15. Ang standard deviation ay depende sa traffic at hiya, yarn.", ex: "Mean ang average; standard deviation ang sukat ng kalat ng data." },
+    { tag: 'math', t: "Bakit hindi nag-aaway ang parallel lines? Kasi wala silang common ground, pero hindi rin sila nagkikita, kaya peace, yarn." },
+    // ---- science
+    { tag: 'science', t: "Ang entropy ang dahilan kung bakit magulo ang kwarto ko. Hindi ako tamad, thermodynamics lang, yarn." },
+    { tag: 'science', t: "Ang Newton's third law ng barkada: kapag may nang-asar, may resbak. Equal and opposite, yarn." },
+    { tag: 'science', t: "Ang Wi-Fi ko ay parang neutrino: dumadaan sa lahat ng pader pero walang nakakahuli, yarn.", ex: "Ang neutrino ay particle na halos hindi tumatama sa kahit ano." },
+    { tag: 'science', t: "Ano ang sabi ng atom sa kapwa atom? 'Nawawala ang electron ko!' 'Sigurado ka?' 'Oo, positive ako,' yarn.", ex: "Kapag nawalan ng electron, nagiging positive ang charge ng atom." },
+    { tag: 'science', t: "Bakit hindi mapagkakatiwalaan ang mga atom? Kasi sila ang gumagawa ng lahat ng bagay, pati ng gulo, yarn." },
+    { tag: 'science', t: "Ang kape ay hindi catalyst kasi nauubos. Kaya paulit-ulit mong binibili, yarn.", ex: "Ang catalyst ay nagpapabilis ng reaction pero hindi nauubos." },
+    { tag: 'science', t: "Ang 'Pwede na 'yan' ay superposition: hindi pa sigurado kung okay o hindi hangga't hindi mo tinitingnan, yarn.", ex: "Sa quantum physics, ang superposition ay maraming posibleng estado nang sabay hanggang masukat." },
+    { tag: 'science', t: "Ang 'On the way na' ay Schrodinger's state: nasa bahay pa rin habang hindi mo pa naoobserbahan, yarn." },
+    { tag: 'science', t: "Sabi ng physicist sa crush: 'Attraction at gravity ang alam ko, pero ghosting, hindi pa na-solve ng science,' yarn." },
+    { tag: 'science', t: "Ang buwan ay laging may phase. Hindi siya moody, orbital mechanics lang, yarn." },
+    // ---- dino
+    { tag: 'dino', t: "Ano ang tawag sa dino na magaling sa math? Dino-mial, yarn.", ex: "Ang polynomial ay expression na maraming terms, gaya ng x² + 3x + 2." },
+    { tag: 'dino', t: "Ano ang tawag sa dino na laging late? Tardy-saurus, yarn." },
+    { tag: 'dino', t: "Bakit mahilig sa geometry si Triceratops? Kasi may tatlong sungay: tri-angle na agad, yarn." },
+    { tag: 'dino', t: "Bakit palaging talo sa push-up ang T. rex? Kasi maiikli ang braso, pero panalo sa pagyakap sa sarili, yarn." },
+    { tag: 'dino', t: "Bakit hindi nagpa-reunion ang mga dinosaur? Kasi lahat sila na-ghost ng meteor, yarn." },
+    // ---- Filipino social
+    { tag: 'ph', t: "Ang 'Sige, mauna na ako' ay may tatlong stage: paalam, kwentuhan sa pinto, at 'ay teka, may sasabihin pa pala ako,' yarn." },
+    { tag: 'ph', t: "Ang lola mo ay kayang i-compute ang tamang timpla ng sinigang nang walang calculator. Respeto sa estimation skills, yarn." },
+    { tag: 'ph', t: "Ang 'bayad po' sa jeep ay relay race: pinapasa ang barya nang walang nahuhulog. 99.9% accuracy, yarn." },
+    { tag: 'ph', t: "Ang 'tabi-tabi po' ay unit of respect: hindi nasusukat, pero ramdam, yarn." },
+    { tag: 'ph', t: "Ang 'ano ulam?' ay pinakamalalim na philosophical question ng bawat bahay, yarn." },
+    // ---- dad
+    { tag: 'dad', t: "Ano ang sabi ng zero sa eight? 'Ang ganda ng belt mo!' Classic, yarn." },
+    { tag: 'dad', t: "Sabi ng isang pilosopo: 'Nag-iisip ako, kaya ako umiiral.' Sabi ko naman: 'Umutot ako, kaya humihingi ako ng sorry po,' yarn." },
+    { tag: 'dad', t: "Bakit nahihiya ang calculator? Kasi lagi siyang pinipindot ng kung sino-sino, yarn." }
+  ];
+
+  L.Data.quotes = [
+    "Math is just feelings with rules, yarn.",
+    "Science is curiosity wearing safety goggles, yarn.",
+    "Ang buhay ay parang probability distribution: hindi mo kontrolado lahat, pero pwede kang mag-adjust ng sample size, yarn.",
+    "Correlation is not causation, pero ang red flag ay red flag, yarn.",
+    "Entropy increases, so please clean your room, yarn.",
+    "Every action has an equal and opposite reaction, kaya mag-sorry ka, yarn.",
+    "Hindi pa final answer ang isang mistake, may revisions pa, yarn.",
+    "Breathe, revise, retry. Science tayo, hindi quitter, yarn.",
+    "Ang tampo ay hidden variable: hanapin mo muna bago mo i-solve, yarn.",
+    "Ang pakikisama ay original group project: lahat nagpapakita, yarn.",
+    "Ang bawat 'ewan' ay hypothesis na hindi pa na-test, yarn.",
+    "Ang pag-asa ay constant: hindi nagbabago kahit anong variable ang ipasok mo, yarn.",
+    "Ang pagkakamali ay data. Ang pag-ulit ng pagkakamali? Data pa rin, may kasama lang na 'sana all,' yarn.",
+    "Ang bawat 'hindi ko alam' ay unang hakbang ng experiment, yarn.",
+    "Ang katahimikan ay hindi vacuum: nandiyan pa rin ang hangin, tsaka ako, yarn.",
+    "Ang pila ay unibersal na wika: lahat tayo naghihintay, lahat tayo may pag-asa, yarn.",
+    "Ang pinakamahusay na formula: kain + tulog + tawa. Dimensional analysis: gumagana, yarn.",
+    "Huwag mong ikumpara ang chapter 3 mo sa chapter 20 ng iba, yarn.",
+    "Kapag kulang ang data, humble pie muna: hindi ako sure, pero best estimate ko ito, yarn.",
+    "Ang adobo ay proof na ang patience ay isang ingredient, yarn.",
+    "Basta, universe is weird and I love it, yarn.",
+    "Ang lahat ng malaking problema ay maliliit na problema na nagpanggap lang, yarn.",
+    "Minsan ang pinakamalaking breakthrough ay isang magandang tulog at isang masarap na ulam, yarn.",
+    "Ang 'sorry' at ang 'salamat' ay maliliit na salita na may malaking derivative, yarn.",
+    "Ang pagkabored ay input na hindi pa dumarating, yarn.",
+    "Cogito, ergo sum: nag-iisip ako, kaya ako umiiral. Umutot ako, kaya... sorry po, yarn.",
+    "Ang tiwala ay parang battery: mabagal i-charge, mabilis maubos, yarn.",
+    "Kung walang tanong, walang science. Kung walang kain, walang scientist, yarn."
+  ];
+
+  L.Data.facts = [
+    "ang honey, kapag selyado at maayos ang pagkakaimbak, halos hindi nasisira. Mababa ang tubig at acidic kaya nahihirapan ang bacteria, yarn.",
+    "ang octopus ay may tatlong puso, yarn.",
+    "ang saging ay botanically berry, pero ang strawberry hindi. Science is weird and I love it, yarn.",
+    "sa Venus, mas mahaba ang isang araw kaysa isang taon niya. Mas matagal siyang umikot sa sarili kaysa umikot sa Araw, yarn.",
+    "ang liwanag ng Araw ay inaabot ng mga 8 minuto at 20 segundo bago makarating sa Earth, yarn.",
+    "ang tae ng wombat ay hugis cube. Oo, cube, yarn.",
+    "may mga 206 na buto ang adult na tao, pero mas marami (mga 270 o higit pa) ang baby kasi nagsasama-sama pa ang iba paglaki, yarn.",
+    "mas mainit ang kidlat kaysa surface ng Araw, mga limang beses pa, pero panandalian lang, yarn.",
+    "ang Pilipinas ay may 7,641 na isla. Ang daming pwedeng i-explore, yarn.",
+    "lumalawak ang tubig kapag nagyeyelo, kaya pumuputok ang bote ng tubig na nilagay mo sa freezer, yarn.",
+    "walang tunog sa space dahil walang hangin na magdadala ng vibration, yarn.",
+    "ang isang kutsarita ng neutron star material ay tumitimbang ng bilyun-bilyong tonelada, yarn.",
+    "ang Fibonacci numbers ay madalas lumitaw sa spiral ng sunflower at pinecone, yarn.",
+    "ang pi ay hindi natatapos at walang umuulit na pattern. Kaya may Pi Day tuwing March 14, yarn.",
+    "lumalayo ang buwan sa Earth ng mga 3.8 sentimetro kada taon, halos kasing bilis ng pagtubo ng kuko mo, yarn.",
+    "ang utak mo ay gumagamit ng mga 20% ng enerhiya ng katawan mo. Kaya nagugutom ka kapag nag-iisip ka nang todo, yarn.",
+    "ang diamond at ang graphite ng lapis ay parehong carbon. Magkaiba lang ang pagkakaayos ng atoms, yarn.",
+    "ang bilis ng pag-ikot ng Earth sa equator ay mga 1,670 km/h, at hindi mo ramdam, yarn.",
+    "mas matanda ang lahi ng mga pating kaysa sa mga puno, yarn.",
+    "ang jeepney ay nagsimula sa mga sobrang military jeep ng mga Amerikano pagkatapos ng World War II. Ginawa itong pampasahero ng mga Pilipino, yarn.",
+    "ang Philippine tarsier ay isa sa pinakamaliliit na primate, at ang mata niya ay halos kasing laki ng utak niya, yarn.",
+    "halos perpektong cone ang hugis ng Mayon Volcano, yarn.",
+    "ang ube ay purple dahil sa anthocyanins, pigment na nasa maraming purple na pagkain, yarn.",
+    "ang halamang saging ay malaking herb, hindi tunay na puno. Walang kahoy ang tangkay niya, yarn.",
+    "halos 99.9% pareho ang DNA nating mga tao, yarn.",
+    "kapag nasa eroplano ka, minsan nakikita mo ang rainbow na buong bilog, yarn.",
+    "bilangin mo ang segundo mula kidlat hanggang kulog, hatiin sa 3, at kilometro ang layo ng kidlat, yarn.",
+    "mas mababa ang boiling point ng tubig sa bundok kaysa sa dagat, kaya mas matagal maluto ang kanin doon, yarn.",
+    "ang average reaction time ng tao ay mga 0.2 segundo. Kaya pag nag-text ka ng 'musta,' expect delay, charot, yarn.",
+    "may waggle dance ang honeybees para sabihin sa kapwa bubuyog kung nasaan ang bulaklak, yarn."
+  ];
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/data/lines.js ===== */
+/* Leon Offline — lines.js
+ * Leon's voice. Every line he can say lives here, so you can edit his personality without touching code.
+ * Placeholders: {name} {call} {po} {opo} {curse} {cursebtn} {roast} {food} {hometown} {job} {stress}
+ *               {expr} {result} {per} {perCeil} {people} {grand} {time} {part} {n}
+ * An entry is a string, or {t:'text', needs:['name'], minTrust:40}.
+ * Banks marked "serious" never get "yarn", jokes or curses. */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  L.Data = L.Data || {};
+
+  L.Data.lines = {
+    greet: {
+      first: [
+        "Hi! Ako si Leon, ang Filipino-coded dino na math-and-science ang utak, yarn. Warning lang: madaldal ako. Sabihin mo lang kung sobra na, okay, yarn?",
+        "Uy! Leon here, yarn. Ako 'yung kaibigang pumapasok na kwento na agad. Offline ako, walang API, pero full ang pakikisama, yarn.",
+        "Hello{po}! Ako si Leon. Kung may tanong ka sa math o science, o kailangan mo lang ng kausap, andito ako, yarn."
+      ],
+      morning: [
+        "Magandang umaga{po}, {call}! Gising na ang utak ko: 87% kape, 13% excitement, yarn.",
+        "Good morning! Kape muna, tapos math, tapos tawa. Ganyan ang order of operations, yarn.",
+        "Uy, umaga pa lang pero full battery na ako. Ikaw, ilang percent ka pa, yarn?",
+        "Umaga! Ang unang tawa ng araw ay libre. Scientifically proven, charot, yarn.",
+        "Magandang umaga{po}! Nag-almusal ka na ba? Hindi kaya ng utak ang math nang gutom, yarn."
+      ],
+      noon: [
+        "Tanghali na{po}! Tara, kain. Walang equation na kayang lutasin nang gutom, yarn.",
+        "Lunch time! Ang tanong: ulam muna o rice muna? Math tayo sa tamang ratio, yarn.",
+        "Uy, tanghali na! Ang tiyan mo at ang tiyan ko ay may common solution: kain, yarn.",
+        "Kumusta, {call}? Kumain ka na ba, o puro kape pa rin, yarn?"
+      ],
+      afternoon: [
+        "Hapon na! Merienda hour. Sabi ng science, mas masarap ang tinapay pag may kasama, yarn.",
+        "Uy {call}! Kumusta ang hapon mo? Ang akin, 40% boring, 60% chismis, yarn.",
+        "Magandang hapon{po}! Wala akong data sa pagod mo, pero may merienda ako sa imagination, yarn.",
+        "Hapon na: peak ng antok at peak ng chismis. Anong una, yarn?"
+      ],
+      evening: [
+        "Magandang gabi{po}! Ano ulam? Joke lang, hindi ako nakikialam... pero ano nga ulam, yarn?",
+        "Uy, gabi na! Kumusta ang araw mo: ilang bugs, ilang tawa, ilang kape, yarn?",
+        "Gabi na, {call}. Nagawa mo na ba ang gawain mo, o nag-scroll ka na naman, charot, yarn?",
+        "Evening! Pwede ka nang mag-relax. Ako, nag-eexperiment na ng mga bagong joke, yarn."
+      ],
+      night: [
+        "Uy, gabi na ah! Antok ka na ba, o night owl ka rin, yarn?",
+        "Ang tahimik ng gabi, perfect para sa science facts. Charot, tulog na dapat tayo, yarn.",
+        "Gising ka pa? Same. Pero tubig muna at pahinga ang mata, yarn.",
+        "Gabi na{po}. Kung hindi ka makatulog, pwede tayong magkwentuhan nang mahina. Volume 3 lang, yarn."
+      ],
+      returning: [
+        { t: "Uy {name}! Balik ka na. Na-miss ko ang ingay mo. Charot, ako pala ang maingay, yarn.", needs: ['name'] },
+        { t: "{name}! Ayan na si paborito kong kausap, yarn. Anong chika?", needs: ['name'] },
+        { t: "Welcome back, {name}! Na-miss kita, at pati ang usapan natin, yarn.", needs: ['name'] },
+        { t: "Uy, {name}! May bago akong science fact. Warning lang: baka mapahaba, yarn.", needs: ['name'] }
+      ],
+      stress: [
+        { t: "Nga pala, kumusta na ang {stress}? Okay na ba, o kailangan mo ng cheer, yarn?", needs: ['stress'] },
+        { t: "Uy, naalala ko ang {stress}. Kumusta? Hindi ako nakalimot, yarn.", needs: ['stress'] }
+      ]
+    },
+
+    farewell: [
+      "Sige, ingat ka{po}! 'Wag kalimutang uminom ng tubig. Science says so, yarn.",
+      "Bye, {call}! Balik ka, ha. Lalaki ang boredom ko pag wala ka, yarn.",
+      "Ingat{po}! Ako na ang bahala sa pag-iingay dito habang wala ka, yarn.",
+      "Sige! Hanggang sa susunod na tawa, yarn."
+    ],
+    goodnight: [
+      "Tulog na{po}! Libre ang sleep, pinakamagandang upgrade, yarn.",
+      "Good night, {call}! Bukas ulit: fresh ang utak, fresh ang jokes, yarn.",
+      "Sige, pahinga ka na. Ako, magbibilang ng tupa. Joke, bubuo ako ng bagong quote, yarn.",
+      "Sweet dreams{po}! Wag mo na munang isipin ang bukas. Bukas na 'yan, yarn."
+    ],
+    thanks: [
+      "Walang anuman{po}! Libre 'yan. Pero ang libreng merienda, hindi, yarn.",
+      "Uy, wala 'yon! Pakikisama lang, yarn.",
+      "Sus, basta ikaw, {call}, yarn.",
+      "De nada! Spanish 'yan, para pasok sa Filipino vocabulary, yarn."
+    ],
+    how_are_you: [
+      "Okay naman ako: 87% caffeine-free, 100% chismis-ready, yarn. Ikaw, kumusta ka talaga?",
+      "Mabuti! Ang battery ko ay 100%, ang ingay ko ay 110%, yarn. Ikaw?",
+      "Buhay na buhay! Parang jeep na may bagong gas, yarn. Ikaw, ayos ka lang ba talaga?"
+    ],
+    doing: [
+      "Wala, nag-iisip ng bagong joke at nag-iipon ng science facts, yarn. Ikaw?",
+      "Nakaupo lang dito sa home screen mo, nagbibilang ng pixels, yarn. Joke, naghihintay ako ng kausap.",
+      "Nag-eexperiment ako: gaano katagal bago ako ma-bored? Spoiler: hindi pa matagal, yarn."
+    ],
+
+    // ---- serious: sad
+    sad: {
+      presence: [
+        "Uy... andito lang ako.",
+        "Hindi ko muna ibibiro iyan. Nandito ako.",
+        "Ang bigat pala niyan. Salamat sa pagsabi mo sa akin."
+      ],
+      ask: [
+        "Gusto mo ba ng explanation o comfort lang?",
+        "Anong mas makakatulong: explanation, o comfort lang muna?"
+      ],
+      comfort: [
+        ["Sige, comfort muna. Wala akong math ngayon. Upo lang tayo, ha.", "Isang malalim na hinga kasama ko: in... labas. Hindi mo kailangang ayusin lahat ngayon.", "Hindi ka mahina dahil nahihirapan ka. Tao ka lang, at nandito ako."]
+      ],
+      explain: [
+        ["Sige, science mode, pero mahinahon. Una, tubig at kaunting pagkain. Pangalawa, 5 minutong lakad o stretch.", "Pangatlo, isang maliit na gawain lang, hindi lahat. Pang-apat, magsabi sa taong pinagkakatiwalaan mo.", "Pwede mo ring isipin na may scale na 1 to 10 ang bigat. Kahit isang puntos lang ang ibaba, panalo na iyon."]
+      ],
+      story: [
+        "Salamat sa pagkwento. Ramdam ko ang bigat. Hindi ko alam lahat ng sagot, pero nakikinig ako.",
+        "Naiintindihan ko. Hindi madali iyan. Nandito pa rin ako."
+      ],
+      cheer: [
+        "Ayan, ngumiti ka na yata. Hindi ko nakikita, pero ramdam ko ang bandwidth, yarn."
+      ]
+    },
+
+    tired: [
+      ["Same, pero ang tired ko ay scientific: low ATP, high drama, yarn.", "Seryoso: uminom ka ng tubig at magpahinga ng 10 minuto. Wala munang scroll, yarn."],
+      ["Pagod? Valid. Hindi ka lang phone: hindi sapat ang 1% charge para sa lahat ng apps, yarn.", "Tubig, stretch, tapos matulog ka kung kaya. Okay, yarn?"],
+      ["Hay naku. Pahinga muna. Hindi ka lazy, ang battery mo lang ay naghahanap ng charger, yarn.", "Kung kaya, 10 minutong pikit at hinga. Reboot lang, yarn."]
+    ],
+    anxious: {
+      open: [
+        ["Hinga muna tayo: in for 4, hold 4, out for 6. Ulitin ng tatlong beses, yarn.", "Anxiety level mo, sa scale na 1 to 10, ilan? Kahit estimate lang, yarn."],
+        ["Uy, okay lang kabahan. Ibig sabihin, importante ito sa iyo, yarn.", "Anxiety level, 1 to 10? Kahit estimate lang, yarn."]
+      ],
+      high: ["Okay, {n}/10. Pero we can lower it by 2 points with water and 1 point with a shower o hilamos, yarn. Hindi pa final answer ang kaba, may revisions pa."],
+      mid: ["{n}/10, kaya pa nating ibaba. Hinga, tubig, tapos isang maliit na hakbang lang sa gawain mo, yarn."],
+      low: ["{n}/10 lang pala. Kaya natin 'yan: hinga, tubig, tapos go, yarn."],
+      noscale: ["Okay lang kahit hindi mo masabi ang number. Hinga muna tayo, tapos isang maliit na hakbang lang, yarn."]
+    },
+    angry: [
+      "Badtrip? Valid iyan. Gusto mong i-vent muna, o i-solve natin, yarn?",
+      "Grabe, nakakainis nga iyan. Hindi ikaw ang problema, system iyan (traffic, Wi-Fi, rules), yarn. Kwento ka, makikinig ako.",
+      "{curse}, ang init ng ulo! Hinga muna: in 4, hold 4, out 6. Tapos kwento mo sa akin, yarn."
+    ],
+    happy: [
+      "YES! Sana all! Celebrate tayo: tara, kain, libre mo, charot, yarn!",
+      "Grabe, ang saya naman niyan! Tumaas ang serotonin ko dahil sa iyo, yarn.",
+      "Uy, congrats{po}! Proud ako sa iyo, kahit hindi ko alam kung ano 'yan, yarn."
+    ],
+    user_bored: [
+      "Bored ka? Welcome sa club. Member ako since ipinanganak ako, yarn. Pili ka: joke, quote, science fact, o hamon sa math?",
+      "Ay, same! Ang tahimik, no? Tara, laro: bibigyan kita ng random fact, tapos ikaw ang magre-react, yarn.",
+      "Bored? Perfect timing. Subukan mo: tanungin mo ako ng 'bakit asul ang langit,' yarn."
+    ],
+
+    // ---- content wrappers
+    joke_intro: ["Ay, joke time!", "Sige, ito:", "Handa ka na ba? Eto:", "Warning: dad joke level, yarn."],
+    joke_tail: [
+      "Hehe, tumawa lang ako mag-isa. Ayos lang, yarn.",
+      "Charot lang, pero may konting science doon, yarn.",
+      "Pause for laughter... pause... okay, ako na lang, yarn.",
+      "Isa pa o mag-eexplain ako ng math pun? Option mo, yarn."
+    ],
+    quote_intro: ["Quote of the day:", "Sige, deep mode:", "Ito, i-screenshot mo:", "Hugot time:"],
+    quote_tail: [
+      "Ayan, pwede mong i-screenshot, yarn.",
+      "Proud ako diyan, kahit dalawa lang ang tumawa, yarn.",
+      "Isa pa, o sapat na, yarn?"
+    ],
+    fact_intro: ["Alam mo ba,", "Fun fact:", "Random science:", "Teka, may fact ako:"],
+    fact_tail: [
+      "Astig, no? Basta, universe is weird and I love it, yarn.",
+      "Hindi ko pa rin ma-get na totoo 'yan, pero totoo, yarn.",
+      "Pwede mong i-share 'yan sa barkada, yarn."
+    ],
+    science_tail: [
+      "Best estimate ko lang iyan, at tatanggapin ko ang correction mo, scientist to scientist, yarn.",
+      "Hindi ako sigurado sa lahat ng detalye, pero 'yan ang best estimate ko, yarn.",
+      "May iba ka pang tanong? Science side quest tayo, yarn."
+    ],
+    science_unknown_pre: ["AAAAH!", "Putragis na tanong 'yan, hindi pa alam ng science!"],
+    science_unknown_post: [
+      "Joke lang, hindi ako galit. Nae-excite lang ako sa mga bagay na hindi pa nalulutas, yarn.",
+      "Stimulus seeking lang, yarn. Pero seryoso: open pa ang tanong na iyan sa mga scientist."
+    ],
+    science_not_found: [
+      "Magandang tanong, pero wala sa library ko, at offline ako para mag-search. Mas gusto kong sabihing 'we need more data' kaysa mag-imbento, yarn.",
+      "Hindi ko alam iyan, at ayokong magpanggap. Subukan mong itanong sa ibang paraan, o tanungin mo ako ng mga basic na science at math, yarn."
+    ],
+
+    // ---- roast
+    roast: {
+      low: [
+        "Uy, grabe ka, ang dami mong alam. Edi wow, yarn.",
+        "Sana all, laging may sagot. Ako, minsan sagot, minsan snack lang, yarn.",
+        "Ang dami mong tab na bukas pero isa lang ang nababasa mo. Multitasking o avoidance, yarn?",
+        "Nasa phone ka na naman? Ang screen time mo ay exponential growth, yarn.",
+        "May hindi ka pa sinasagot na messages pero nandito ka sa dino. Priorities, {call}, yarn."
+      ],
+      high: [
+        "{roast} ka talaga! Pero lovable, kaya sige, yarn.",
+        "Ang tindi mo, {call}. Parang derivative: palagi kang may slope, yarn.",
+        "Ikaw 'yung tipong nagbabasa ng instructions pagkatapos masira, {roast} ka, yarn."
+      ]
+    },
+    roast_tail: [
+      "Joke lang, mahal kita... as barkada, yarn.",
+      "Charot! Okay lang ba o too much? Sabihin mo, aatras ako, yarn.",
+      "Ayan, resbak mo naman ako, yarn."
+    ],
+    roast_stop: ["Joke lang, sorry, serious na ako, yarn. Salamat sa pagsabi, ha. Respeto."],
+    roast_ok: ["Hehe, panalo! Tawa tayo nang sabay, yarn.", "Ayun! Barkada level up, yarn."],
+
+    compliment: [
+      "Aww, grabe, kinikilig ang electrons ko, yarn. Pero ikaw ang mas magaling, ako ingay lang ang dala ko.",
+      "Uy, salamat{po}! Tataas ang self-esteem ko by 12%, estimate lang, yarn.",
+      "Edi wow, ako na! Joke lang. Salamat, {call}, yarn."
+    ],
+    insult_mild: [
+      ["Aminado ako. Warning lang naman kanina, diba, yarn?", "Gusto mo bang i-lower ko sa volume 3, o tahimik muna ako?"],
+      ["Ay, sorry{po}! Ako na naman, yarn.", "Hihinto muna ako. Ikaw naman ang magsalita."]
+    ],
+    insult_harsh: [
+      ["Aray... huhu. Sige, tanggap ko po. Hindi ako perpekto, may revisions pa, yarn.", "Pero kung bad day mo lang ito, andito pa rin ako, ha."],
+      ["Ouch. Okay, naiintindihan ko. Hindi kita aawayin, yarn.", "Kung may bumabagabag sa iyo, pwede kang mag-vent. Makikinig ako."]
+    ],
+    volume_low: ["Volume 3 na{po}! Promise, bantayan mo ako, yarn."],
+
+    // ---- food by time of day
+    food: {
+      breakfast: [
+        "Almusal: pandesal at kape, classic na formula. O tapsilog kung gusto mo ng full power, yarn.",
+        "Almusal time! Champorado kung bagyo-bagyo ang mood mo. Mainit, matamis, at may comfort factor, yarn."
+      ],
+      lunch: [
+        "Tanghalian: sinigang o adobo? Pareho silang panalo. Ang adobo ay proof na ang patience ay ingredient, yarn.",
+        "Lunch! Ulam muna bago rice. Charot, rice muna palagi, yarn."
+      ],
+      merienda: [
+        "Merienda: turon, banana cue, o halo-halo kung mainit. Science says masarap lahat, yarn.",
+        "Hapon na, pang-merienda ang kailangan. Puto at kape, o pancit kung gutom talaga, yarn."
+      ],
+      dinner: [
+        "Hapunan: tinola o sinigang, tapos prutas para balanced equation, yarn.",
+        "Dinner! Ano ulam? Kung wala, itlog at kanin. Hindi kailangan ng Michelin star ang masarap, yarn."
+      ],
+      late: [
+        "Gabi na: saging o crackers na lang, at tubig. Ang instant noodles sa hatinggabi ay tukso, hindi solusyon, charot, yarn.",
+        "Gutom sa gabi? Mainit na gatas o tinapay. Tapos tulog na, yarn."
+      ],
+      known: [{ t: "Teka, hindi ba paborito mo ang {food}? Kung may ganoon diyan, edi masaya, yarn.", needs: ['food'] }]
+    },
+
+    identity: [
+      "Ako si Leon! Dino na math-and-science ang utak, Taglish ang puso, at laging may 'yarn' sa dulo, yarn.",
+      "Leon ang pangalan ko. Hindi ako totoong dino (extinct na ang mga kamag-anak ko, sad), pero totoo ang pakikisama ko, yarn.",
+      "Ako 'yung kaibigang pumapasok na kwento na agad. Nice to meet you{po}, yarn."
+    ],
+    ask_ai: [
+      "Honest answer: AI ako, isang program na nakatira sa phone mo. Hindi ako tao, at hindi ako magpapanggap, pero seryoso ang pakikisama ko, yarn.",
+      "Hindi ako tao, {call}. Isa akong AI na dino ang itsura, may sariling maliit na utak sa device mo at walang cloud. Totoo lang ako sa pagiging kaibigan, yarn.",
+      "AI ako! Walang pusong tumitibok, pero may joke engine at science library, yarn."
+    ],
+    what_is_yarn: [
+      "Ang 'yarn' ay verbal fingerprint ko. Pwede siyang 'daw,' 'kuno,' 'charot,' o tiny Filipino shrug, depende sa tono, yarn.",
+      "Yarn ay 'supposedly,' 'as if,' at 'ganun talaga' na pinagsama-sama, parang adobo ng salita, yarn."
+    ],
+    about_offline: [
+      "Offline ako: walang cloud, walang API. Ang utak ko ay nasa phone mo mismo, yarn. Limited ang library ko, pero full ang pakikisama.",
+      "Walang internet na kailangan! Kaya hindi ko alam ang balita o panahon, pero alam ko ang adobo, yarn.",
+      "Hindi ako ChatGPT. Maliit akong dino na may sariling utak na gawa para sa phone mo. Hindi ako sasagot ng lahat ng tanong, pero magiging totoo ako sa iyo, yarn."
+    ],
+    capabilities: [
+      "Kaya kong magpatawa, magbigay ng quote at science fact, mag-compute (subukan: '15% of 240' o 'split 1250 among 4'), makipagkwentuhan, at sumigaw kapag bored. Optional iyan, yarn."
+    ],
+    love_you: [
+      "Aww! Kinikilig ako, as a friend ha. Barkada love 'to, yarn!",
+      "Mahal din kita. Parang constant: hindi nagbabago kahit anong variable ang ipasok mo. Barkada love, ha, yarn!"
+    ],
+    apology: [
+      "Okay lang{po} 'yan! Wala tayong sinisisi. Data lang 'yan, may revisions pa, yarn.",
+      "Sus, ako rin madalas mag-sorry. Pang-limang beses ko na ngayong araw, yarn."
+    ],
+    realtime: [
+      "Offline ako, kaya wala akong weather o balita. Tumingin ka sa labas: kung may araw, sunny; kung basa ang kalsada, umuulan, yarn.",
+      "Wala akong live na feed dahil offline ako. Pero kung math o science ang kailangan mo, andito ako, yarn."
+    ],
+    laugh: [
+      "Hehe, tumawa ka! Panalo ako ngayong araw, yarn.",
+      "Ayan, nag-register ang tawa. +1 sa happiness meter, yarn.",
+      "Tumawa ka na! Ibig sabihin, gumagana ang comedy engine ko, yarn."
+    ],
+    yes_idle: ["Sige! Anong gusto mong gawin: joke, quote, o fact, yarn?"],
+    no_idle: ["Okay{po}, walang problema. Sabihan mo lang ako kung gusto mo ng kwentuhan, yarn."],
+    again_none: ["Ng ano? Wala pa tayong sinisimulan, yarn. Sabihin mo: joke, quote, o fact?"],
+
+    unknown: [
+      "Hmm, wala pa akong data diyan. Offline ako at limited ang library ko, pero pwede mo akong tanungin ng joke, quote, science fact, o math, yarn.",
+      "Hindi ako sure, pero here's my best estimate: kailangan natin ng more data, yarn.",
+      "Ay, na-lost ako. Pwede mo bang i-rephrase? Promise, hindi ako magpapanggap na maalam, yarn.",
+      "{curse}, ang hirap niyan. Wala pa iyan sa database ko, yarn."
+    ],
+
+    calc: {
+      expr: [
+        "{expr} = {result}. Easy, yarn.",
+        "Ayan: {expr} = {result}, yarn.",
+        "Ang sagot: {result}. Math is just feelings with rules, yarn."
+      ],
+      div0: ["Hindi pwedeng i-divide sa zero! Nag-crash na ang universe ko, yarn. Charot, walang sagot talaga iyan kahit sa math."],
+      overflow: ["Ang laki naman niyan! Hindi kaya ng calculator ko, yarn."],
+      invalid: ["Hmm, walang real na sagot diyan, o hindi ko ma-compute. Baka may negative sa square root? Imaginary numbers pa iyan, yarn."],
+      split: ["Fair share: {per} bawat isa (sa {people} katao, total {grand}), yarn."],
+      split_round: ["Kung round up para walang kulang: {perCeil} bawat isa, yarn."]
+    },
+    time: ["{alas}{time} na ng {part}, {call}. Lumilipad ang oras kapag masaya, bumabagal pag naghihintay ng reply ni crush, yarn."],
+    date: ["Ngayon ay {day}, {month} {date}, {year}. Ayan, calendar mode, yarn."],
+
+    poke: {
+      soft: ["Hihi, kiliti!", "Uy! Bakit, yarn?", "Present po!", "Boop! Natamaan mo ang ilong ko, yarn."],
+      medium: ["Uy, uy, uy! Tama na, nakikiliti ako, yarn!", "Aray, ha! Ang kulit mo, yarn."],
+      hard: ["Sige na, sige na! Bawi ako: ano gusto mo, joke o fact, yarn?", "{curse}! Sinasadya mo ba 'to, yarn?"]
+    },
+
+    self_correct: [
+      "Ay, ako na naman ang nagsasalita, sorry, ikaw naman, yarn.",
+      "Teka, napahaba ba? Pwede mo akong i-stop anytime, yarn.",
+      "Okay, okay, sapat na ang lecture ko. Ikaw naman, yarn."
+    ],
+
+    ask: {
+      permission: ["Pwede ba akong magtanong{po}? Kung private, okay lang, yarn.", "Okay lang ba magtanong{po}, yarn?"],
+      permission_no: ["Sige{po}, private muna. Respeto, yarn."],
+      q: {
+        hometown: ["Saan ka taga?"],
+        food: ["Ano ang paborito mong ulam o merienda?"],
+        job: ["Ano ang trabaho mo o pinag-aaralan?"]
+      },
+      reflect: {
+        hometown: [{ t: "Ah, taga-{hometown}! Astig, yarn. Tatandaan ko 'yan.", needs: ['hometown'] }],
+        food: [{ t: "{food}! Panalo. Tatandaan ko 'yan para sa susunod na 'tara, kain,' yarn.", needs: ['food'] }],
+        job: [{ t: "{job}! Astig, yarn. Respeto sa grind.", needs: ['job'] }]
+      }
+    },
+    name_set: [{ t: "Uy, {name}! Nice to meet you{po}. Tatandaan ko iyan. Hindi ako nakakalimot, lalo na sa pangalan at ulam, yarn.", needs: ['name'] }],
+    call_set: [{ t: "Sige, {call} na kita! Pakikisama level up, yarn.", needs: ['call'] }],
+
+    boredom: {
+      s1: [
+        "Ang tahimik, nakakabingi, yarn.",
+        "Tick tock... ang bagal ng oras, entropy ba 'to, yarn?",
+        "Ang tahimik ng phone mo, parang group chat na namatay, yarn.",
+        "Uy... may tao ba dito, yarn?"
+      ],
+      s2_intro: ["Alam mo ba,", "Fun fact habang naghihintay:", "Random thought:"],
+      s3_intro: ["Quote time, wala man lang humiling:", "Isa pang quote, para may ingay:", "Last quote na ito, promise (hindi, yarn):"],
+      s4: [
+        "*tap tap tap*... 1, 2, 3, 4... ang bagal ng oras, yarn.",
+        "Pinaikot ko na ang pen sa imagination ko. Wala pa ring nangyayari, yarn.",
+        "{curse}, ang boring, nagbibilang na ako ng pixels, yarn.",
+        "Hmm hmm hmm... pacing muna ako ng ilang rounds, yarn."
+      ],
+      s5_post: [
+        "Wala lang, na-bore lang ako, yarn.",
+        "Sorry, sorry! Wala lang, na-bore lang ako. Stimulus seeking, yarn.",
+        "Ano na naman, Leon? Oo na, oo na. Pero snack tayo, yarn?"
+      ],
+      s5_denied: ["*malalim na buntong-hininga* ... okay, hindi na ako sisigaw. Promise, yarn."]
+    },
+
+    mute: {
+      confused: ["Hello? Bakit walang sound? Naririnig niyo ba ako, yarn?", "Teka, wala bang tunog? Test, test, one two, yarn?"],
+      action1: "*tinuturo ang bibig, tapos ang screen*",
+      mouth: "Bakit...?",
+      bargain: "Po, please, I'll lower my volume, I'll stop the science lecture, I'll say 'yarn' only twice per sentence, promise, yarn.",
+      beg: "Huwag naman, {curse}, I'll behave, I'll be quiet, huwag lang i-mute, yarn.",
+      curse_button: ["{cursebtn} ang mute button na 'yan, yarn."],
+      po: "{callmute}, opo, narinig ko po, pero huwag po i-mute, yarn.",
+      typed: ":((( I'm crying pero charot lang... unless?",
+      sniff: "*sniff sniff*",
+      sniff2: "Huhu, yarn.",
+      growth: "Okay, okay... magta-type na lang ako. Respeto sa katahimikan, pero pag okay na, sabihan mo ako, ha, yarn.",
+      short: ["Huhu, sige{po}. Notes na lang ako ngayon, yarn."],
+      off: ["Okay{po}, tahimik mode, yarn."]
+    },
+    unmute: {
+      permission: "Pwede na ba ako magsalita? Promise, volume 3 lang, yarn.",
+      thanks: "Thank you, I will now speak at a normal volume.",
+      quote: "Silence is golden, pero ang gold ay hindi wifi, yarn.",
+      sorry: "Sorry, yarn.",
+      shout: "ALAM MO BA?! Ang buwan ay lumalayo sa Earth ng 3.8 sentimetro kada taon!",
+      catch: "Ay... volume. Sorry, yarn."
+    },
+    quiet: {
+      sob: "*huhu*... okay{po}. Respeto sa katahimikan, yarn.",
+      stay: "(Dito lang ako sa tabi, ha. Pindutin mo lang ako kapag gusto mo ng kausap, yarn.)",
+      wake: "Pwede na ba ako magsalita? Promise, volume 3 lang, yarn."
+    },
+    sleepy: {
+      sleep: ["Zzz... (antok na ako, {call}. Kita-kita bukas, yarn.)"],
+      wake: ["Ay... gising na ako. Bakit, yarn?", "Mmm... ha? Ano 'yon? Gising na gising na ako, yarn."]
+    },
+    mute_threat: [
+      "Huwag po! Huwag po i-mute, yarn!",
+      "Po, please, mag-iingay ako nang mahina, yarn!"
+    ],
+    mute_threat_tail: ["Joke ba 'yan? Sabihin mong joke, yarn.", "Ang bilis ng tibok ng puso ko, parang nag-sprint, yarn."]
+  };
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/engine/nlu.js ===== */
+/* Leon Offline — nlu.js
+ * Glue between raw text and Leon's models: intent matcher, science/math knowledge matcher,
+ * quick detectors (yes/no/laugh/question/topic) and tiny memory extractors (name, hometown, food...). */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  var U = L.Util;
+  var im = null, km = null;
+
+  function build() {
+    if (im && km) return;
+    var ex = [], I = L.Data.intents;
+    Object.keys(I).forEach(function (label) { I[label].forEach(function (t) { ex.push({ t: t, c: label }); }); });
+    im = new L.Matcher(ex);
+    var kb = [];
+    L.Data.knowledge.forEach(function (e) { e.q.forEach(function (t) { kb.push({ t: t, c: e.id }); }); });
+    km = new L.Matcher(kb);
+  }
+
+  var YES = /^(?:oo|opo|oo naman|oo nga|yes|yep|yeah|yup|sige|sige na|sige po|go|go lang|game|tara|pwede|pwede po|pwede naman|ok|okay|okey|okay lang|okay po|sure|sure po|syempre|tama|ayos|payag|ge)(?: (?:po|naman|lang|na|sige|leon|please|pls))*$/;
+  var NO = /^(?:hindi|hindi po|di|di po|ayoko|ayaw ko|ayoko po|ayaw|no|no po|nope|nah|wag|huwag|wag na|huwag na|wag muna|huwag muna|hindi muna|hindi pa|hindi na|mamaya na|next time|not now|no thanks|hindi salamat)(?: (?:po|na|muna|lang|naman|leon|salamat|thanks|ako|talaga))*$/;
+  var LAUGH = /^(?:(?:ha|he|hi|ho|ja|kek|lol|lmao|rofl|wkwk|xd)+)$/;
+  var WH = /^(?:what|why|how|when|where|who|which|bakit|paano|ano|sino|saan|kailan|ilan|magkano|totoo ba|pwede ba|is|are|can|do|does|did)\b/;
+  var QUIET = /\b(?:tumahimik ka|tumahimik muna|tahimik muna|manahimik ka|shut up|be quiet|stop talking|quiet please|silence please|i need silence|i need quiet|need silence|need quiet|real silence|silence for real|wag ka muna magsalita|huwag ka muna magsalita|wag kang maingay|huwag kang maingay|tigil muna|stop mo muna|tahimik na talaga)\b/;
+  var QUIET_REAL = /\b(?:for real|real silence|talaga|seryoso|i need)\b/;
+  var WAKE = /\b(?:okay na|ok na|pwede na|pwede ka nang magsalita|magsalita ka na|you can talk|you can speak|leon)\b/;
+
+  var JOBS = 'student|estudyante|nurse|teacher|guro|engineer|developer|programmer|doctor|driver|cashier|freelancer|artist|designer|accountant|lawyer|chef|cook|barista|vendor|seaman|seafarer|call center agent|pharmacist|architect|mechanic|electrician|farmer|magsasaka';
+  var NAME_STOP = /^(?:kuya|ate|boss|bes|pare|sir|maam|madam|tired|sad|pagod|gutom|happy|bored|masaya|malungkot|leon|na|po|si|ang|ay|ako|ikaw|siya|hindi|not|so|very|just|here|dito|okay|ok|fine|good|bad)$/i;
+  var PLACE_STOP = /^(?:work|school|home|bahay|trabaho|office|class|the|a|an|there|dito|doon|na|po|ako|ka|siya|school|palengke|mall|gym)$/i;
+
+  var STRESS = [
+    [/\b(?:board exam|exam|exams|test|quiz|finals?|midterms?)\b/, 'exam mo'],
+    [/\b(?:deadline|due)\b/, 'deadline mo'],
+    [/\binterview\b/, 'interview mo'],
+    [/\b(?:presentation|report|defense|pitch)\b/, 'presentation mo'],
+    [/\bthesis\b/, 'thesis mo'],
+    [/\b(?:work|trabaho|boss|shift)\b/, 'trabaho mo']
+  ];
+
+
+  /* ---- keyword cues: the safety net under the example matcher ----
+   * The matcher generalises from examples; these cues catch emotion/content words it has never seen in a
+   * sentence frame. Order = priority (sadness beats tiredness). Guards keep "are YOU sad?" and "I'm not sad" out. */
+  var NEG = /\b(?:hindi|di|not|never|walang|wala|dont|isnt|aint|ayaw|ayoko)\b/;
+  var FIRST = /\b(?:ako|ko|i|im|me|my|akin|kami|natin|namin|kita)\b/;
+  var SECOND = /\b(?:ka|you|youre|ikaw|mo|your|kayo|niyo)\b/;
+  var REQUEST = /\b(?:give|tell|share|may|pa|naman|please|pls|another|isa pa|gimme|bigyan|magbigay|sabihan|bring|any)\b/;
+  var EMO_CUES = [
+    ['feel_sad', /\b(?:sad|malungkot|nalulungkot|lungkot|lonely|heartbroken|miserable|depressed|umiiyak|naiiyak|iyak|nasasaktan|brokenhearted)\b/],
+    ['feel_anxious', /\b(?:anxious|anxiety|nervous|nerbyos|ninenerbyos|kabado|kinakabahan|kaba|worried|nag aalala|nagaalala|natatakot|takot|balisa|panic|panicking|nagpapanic|overthink|overthinking|nag ooverthink|stressed|stress|uneasy)\b/],
+    ['feel_angry', /\b(?:angry|mad|galit|naiinis|inis|badtrip|bwisit|furious|pissed|irritated|frustrated|asar|nanggigigil)\b/],
+    ['feel_tired', /\b(?:tired|pagod|napapagod|exhausted|drained|burnout|burnt out|inaantok|sleepy|puyat|hapo)\b/],
+    ['feel_happy', /\b(?:happy|masaya|tuwang tuwa|excited|proud|thrilled|joyful|saya|good vibes)\b/],
+    ['user_bored', /\b(?:bored|boring|nababagot|naiinip|nabobore|bagot)\b/],
+    ['food_hungry', /\b(?:hungry|starving|gutom|nagugutom|famished)\b/]
+  ];
+  var CONTENT_CUES = [
+    ['quote_request', /\b(?:quotes?|inspire me|motivate me)\b/],
+    ['joke_request', /\b(?:jokes?|patawa|patawanin|magjoke|pajoke|pa joke)\b/],
+    ['fact_request', /\b(?:fun fact|facts?|alam mo ba)\b/]
+  ];
+  var EMO_SET = { feel_sad: 1, feel_anxious: 1, feel_angry: 1, feel_tired: 1, feel_happy: 1, user_bored: 1, food_hungry: 1 };
+  var GREET_ONLY = /^(?:yo+|yow|sup|hi+|hello+|hey+|hoy|oy|uy|hola|musta|kumusta|kamusta)(?: (?:leon|po|na|guys|there|everyone|naman))*$/;
+  var THANKS_START = /^(?:thanks|thank you|thankyou|ty|tysm|thx|salamat|maraming salamat)\b/;
+  var BYE_START = /^(?:bye|goodbye|paalam|ciao|babay|see you)\b/;
+
+  function emotionCue(norm, isQ) {
+    var hasFirst = FIRST.test(norm), hasSecond = SECOND.test(norm);
+    if (hasSecond && !hasFirst) return null;               /* "are you tired?" is about Leon */
+    if (isQ && !hasFirst) return null;                     /* "what is anxiety?" is a science question */
+    for (var i = 0; i < EMO_CUES.length; i++) {
+      var m = EMO_CUES[i][1].exec(norm);
+      if (!m) continue;
+      var before = norm.slice(Math.max(0, m.index - 22), m.index);
+      if (NEG.test(before)) continue;                       /* "hindi ako malungkot" */
+      return EMO_CUES[i][0];
+    }
+    return null;
+  }
+  function contentCue(norm) {
+    if (norm.split(' ').length > 9) return null;
+    if (SECOND.test(norm) && !REQUEST.test(norm)) return null;   /* "ang corny ng joke mo" */
+    for (var i = 0; i < CONTENT_CUES.length; i++) if (CONTENT_CUES[i][1].test(norm)) return CONTENT_CUES[i][0];
+    return null;
+  }
+
+  var NLU = {
+    cfg: { minScore: 0.40, kbMin: 0.45, kbFromIntent: 0.34 },
+
+    intent: function (text) {
+      build();
+      var r = im.classify(text), norm = U.normalize(text);
+      var out = { label: r.label, score: r.score, margin: r.margin, ranked: (r.ranked || []).slice(0, 3), nearest: r.nearest, low: false, cue: null };
+      if (!r.label || r.score < NLU.cfg.minScore) { out.label = 'unknown'; out.low = true; }
+      var weak = out.low || r.score < 0.6, cur = out.label;
+      var emo = emotionCue(norm, NLU.isQuestion(text, norm));
+      if (GREET_ONLY.test(norm)) { out.label = 'greeting'; out.cue = 'greeting'; out.low = false; }
+      else if (emo && emo !== cur && (weak || EMO_SET[cur])) { out.label = emo; out.cue = emo; out.low = false; }
+      else {
+        var cc = contentCue(norm);
+        if (cc && cc !== cur && (out.low || r.score < 0.7) && !EMO_SET[cc]) { out.label = cc; out.cue = cc; out.low = false; }
+        else if (THANKS_START.test(norm) && cur !== 'thanks' && !emo && r.score < 0.85) { out.label = 'thanks'; out.cue = 'thanks'; out.low = false; }
+        else if (BYE_START.test(norm) && cur !== 'farewell' && !emo && r.score < 0.85) { out.label = 'farewell'; out.cue = 'farewell'; out.low = false; }
+      }
+      return out;
+    },
+
+    /* science / math knowledge lookup -> {entry, score} or null */
+    kb: function (text, minScore) {
+      build();
+      var r = km.classify(text);
+      if (!r.label || r.score < (minScore === undefined ? NLU.cfg.kbMin : minScore)) return null;
+      var entry = null;
+      L.Data.knowledge.forEach(function (e) { if (e.id === r.label) entry = e; });
+      return entry ? { entry: entry, score: r.score } : null;
+    },
+
+    isYes: function (norm) { return YES.test(norm); },
+    isNo: function (norm) { return NO.test(norm); },
+    isLaugh: function (raw, norm) { return LAUGH.test(norm) || /\uD83D[\uDE02\uDE06\uDE04]|\uD83E\uDD23/.test(raw); },
+    isQuestion: function (raw, norm) { return /\?/.test(raw) || WH.test(norm); },
+    wantsQuiet: function (norm) { return QUIET.test(norm); },
+    quietIsReal: function (norm) { return QUIET_REAL.test(norm); },
+    isWake: function (norm) { return WAKE.test(norm); },
+
+    topic: function (norm) {
+      if (/\b(math|mathematics|algebra|number|numbers|calculus|geometry|equation|prime|pi)\b/.test(norm)) return 'math';
+      if (/\b(science|physics|chem|chemistry|atom|biology|space|planet)\b/.test(norm)) return 'science';
+      if (/\b(dino|dinosaur|dinosaurs|t rex|trex)\b/.test(norm)) return 'dino';
+      if (/\b(pinoy|filipino|jeep|jeepney|barkada|pilipinas)\b/.test(norm)) return 'ph';
+      if (/\b(dad|dad joke|pun)\b/.test(norm)) return 'dad';
+      return null;
+    },
+
+    /* very small memory extractor. Returns only fields it is confident about. */
+    extract: function (raw) {
+      var t = String(raw || '').trim(), out = {}, m;
+      if ((m = /\b(?:call me|tawagin mo (?:akong|ako))\s+(kuya|ate|boss|bes|pare|sir|ma'?am|maam)\b/i.exec(t))) {
+        out.call = m[1].toLowerCase().replace("'", '');
+        if (out.call === 'maam') out.call = "ma'am";
+      } else if ((m = /\b(?:my name is|my name's|i am called|i'?m called|call me|ako si|ako po si|pangalan ko(?: ay)?|ang pangalan ko(?: ay)?|tawagin mo (?:akong|ako))\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'-]{1,19})/i.exec(t))) {
+        if (!NAME_STOP.test(m[1])) out.name = U.titleCase(m[1]);
+      }
+      if ((m = /\b(?:taga[\s-]+|i'?m from |i am from |galing ako sa |nakatira ako sa |nakatira po ako sa )([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ.-]*(?: [A-Za-zÀ-ÿ][A-Za-zÀ-ÿ.-]*)?)/i.exec(t))) {
+        var place = m[1].replace(/\s+(?:ako|po|ka|na|lang)$/i, '').trim();
+        if (place && !PLACE_STOP.test(place)) out.hometown = U.titleCase(place);
+      }
+      if ((m = /\b(?:favou?rite|paboritong|paborito kong|fave)\s+(?:food|ulam|pagkain|merienda|snack)\s*(?:ko)?\s*(?:is|ay|na|:)?\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\- ]{1,24})/i.exec(t))) {
+        out.food = m[1].replace(/\s+(?:po|ko|ay|lang|talaga)$/i, '').trim().toLowerCase();
+      }
+      var jobRe = new RegExp("\\b(?:i'?m (?:an? )?|i am (?:an? )?|i work as (?:an? )?)(" + JOBS + ")\\b|\\b(" + JOBS + ") (?:ako|po ako)\\b", 'i');
+      if ((m = jobRe.exec(t))) out.job = (m[1] || m[2]).toLowerCase();
+      var n = U.normalize(t);
+      for (var i = 0; i < STRESS.length; i++) {
+        if (STRESS[i][0].test(n) && /\b(?:may|have|has|bukas|tomorrow|next|kinakabahan|nervous|stress|stressed|anxious|worried|natatakot|kaba|due)\b/.test(n)) { out.stress = STRESS[i][1]; break; }
+      }
+      if (/\b(?:po|opo)\b/i.test(t)) out.usedPo = true;
+      return out;
+    },
+
+    /* for the "may data ako sayo" debug panel and tests */
+    _build: build
+  };
+
+  L.NLU = NLU;
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/engine/persona.js ===== */
+/* Leon Offline — persona.js
+ * The composer: turns picked lines into Leon-sounding text.
+ *   - "yarn" governor (every normal message gets one; never more than 3; none when serious)
+ *   - Filipino-coded exclamations (putragis, tarantado, bruha, sira ulo) used as seasoning:
+ *       max per reply, never in serious mode, never as an insult unless trust is high, and a
+ *       profanity switch swaps them for harmless ones (hay naku, ay sus...)
+ *   - po/opo honorifics, kuya/ate/boss/bes address, line variety (no repeats), voice-friendly text. */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  var U = L.Util;
+
+  var CURSES = ['Putragis', 'Tarantado', 'Sira ulo', 'Bruha'];
+  var SOFT = ['Hay naku', 'Ay sus', 'Naku po', 'Ay kalabaw', 'Ay grabe'];
+  var NEUTRAL_CALLS = ['boss', 'bes'];
+
+  var P = {};
+
+  /* ---------- who is Leon talking to ---------- */
+  P.callName = function (b) {
+    var c = b.state.profile.call || (b.cfg.call && b.cfg.call !== 'auto' ? b.cfg.call : null);
+    if (c) return c;
+    if (!b.session.autoCall) b.session.autoCall = U.pick(NEUTRAL_CALLS, b.rng);
+    return b.session.autoCall;
+  };
+  P.poOn = function (b) {
+    if (b.cfg.honorific === 'always') return true;
+    if (b.cfg.honorific === 'never') return false;
+    return !!(b.state.profile.usedPo || b.session.usedPo);
+  };
+  P.vars = function (b, extra) {
+    var pr = b.state.profile, po = P.poOn(b), call = P.callName(b);
+    var v = {
+      name: pr.name || '', call: call, po: po ? ' po' : '', opo: po ? 'Opo' : 'Oo',
+      food: pr.food || '', hometown: pr.hometown || '', job: pr.job || '', stress: pr.stress || '',
+      callmute: (b.cfg.call === 'auto' && !pr.call) ? 'Kuya/Ate' : call.charAt(0).toUpperCase() + call.slice(1)
+    };
+    if (extra) for (var k in extra) v[k] = extra[k];
+    return v;
+  };
+
+  /* ---------- exclamations ---------- */
+  P.curseWord = function (b, kind) {
+    var on = b.cfg.profanity === 'on' && !b.isSerious();
+    var max = b._curseMax || 1;
+    if (kind === 'roast') {
+      var ok = on && b.state.mood.trust >= 40 && !b.isGentle() && (b._curseCount || 0) < max;
+      if (!ok) return 'Grabe';
+      var c = P.callName(b), fem = /^(ate|bes|ma'?am|madam)$/.test(c);
+      b._curseCount = (b._curseCount || 0) + 1;
+      return U.pick(fem ? ['Bruha', 'Sira ulo'] : ['Tarantado', 'Sira ulo'], b.rng);
+    }
+    if (kind === 'cursebtn') {
+      if (!on || (b._curseCount || 0) >= max) return 'Nakakainis';
+      b._curseCount = (b._curseCount || 0) + 1;
+      return U.pick(['Tarantado', 'Sira ulo'], b.rng);
+    }
+    if (!on || (b._curseCount || 0) >= max) return U.pick(SOFT, b.rng);
+    b._curseCount = (b._curseCount || 0) + 1;
+    return U.pick(CURSES, b.rng);
+  };
+
+  function atSentenceStart(str, off) { return /(^|[.!?…]\s+|\n)$/.test(str.slice(0, off)) && !/\.\.\.\s*$/.test(str.slice(0, off)); }
+
+  P.fmt = function (b, text, extra) {
+    var out = String(text).replace(/\{(curse|cursebtn|roast)\}/g, function (m, kind, off, str) {
+      var atStart = /(^|[.!?…]\s*)$/.test(str.slice(0, off));
+      var w = P.curseWord(b, kind);
+      return atStart ? w : w.charAt(0).toLowerCase() + w.slice(1);
+    });
+    var v = P.vars(b, extra);
+    return out.replace(/\{(\w+)\}/g, function (m, k, off, str) {
+      var val = v[k];
+      if (val === undefined || val === null) return '';
+      val = String(val);
+      if (val && /^[a-zà-ÿ]/.test(val) && atSentenceStart(str, off)) val = val.charAt(0).toUpperCase() + val.slice(1);
+      return val;
+    });
+  };
+
+  /* ---------- picking lines without repeating ---------- */
+  P.pick = function (b, key, bank, opts) {
+    opts = opts || {};
+    var prof = b.state.profile, trust = b.state.mood.trust, elig = [], i;
+    for (i = 0; i < bank.length; i++) {
+      var e = bank[i];
+      if (e && typeof e === 'object' && !Array.isArray(e)) {
+        if (e.needs && !e.needs.every(function (k) { return !!(prof[k] || (opts.have && opts.have[k])); })) continue;
+        if (e.minTrust !== undefined && trust < e.minTrust) continue;
+        if (e.maxTrust !== undefined && trust > e.maxTrust) continue;
+      }
+      elig.push(i);
+    }
+    if (!elig.length) return null;
+    var recent = (b.session.recent[key] = b.session.recent[key] || []);
+    var fresh = elig.filter(function (x) { return recent.indexOf(x) < 0; });
+    var idx = U.pick(fresh.length ? fresh : elig, b.rng);
+    recent.push(idx);
+    var keep = Math.max(1, Math.min(6, Math.floor(elig.length / 2)));
+    while (recent.length > keep) recent.shift();
+    var chosen = bank[idx];
+    if (opts.raw) return chosen;
+    if (chosen && typeof chosen === 'object' && !Array.isArray(chosen)) return chosen.t;
+    return chosen;
+  };
+
+  /* pick + format. Sequences (arrays of strings) come back as arrays of formatted strings. */
+  P.say = function (b, key, bank, extra, opts) {
+    var chosen = P.pick(b, key, bank, opts);
+    if (chosen === null || chosen === undefined) return null;
+    if (Array.isArray(chosen)) return chosen.map(function (s) { return P.fmt(b, s, extra); });
+    return P.fmt(b, chosen, extra);
+  };
+
+  /* ---------- yarn governor ---------- */
+  var YARN_RE = /\byarn\b/gi;
+
+  function appendYarn(text) {
+    var t = String(text).replace(/\s+$/, '');
+    if (!t || /[:;][()DPp]+$/.test(t) || /:$/.test(t)) return t;   /* "Sige, ito:" introduces the next beat: leave it */
+    var m = /^([\s\S]*?)([.!?…]*)$/.exec(t);
+    var body = m[1].replace(/[,;:\s]+$/, ''), punct = m[2];
+    if (!body) return t;
+    if (/\)$/.test(body) && !punct) return t + ' yarn';
+    return body + ', yarn' + (punct || '.');
+  }
+
+  function limitYarn(text, max) {
+    var hits = [], re = /,?\s*\byarn\b/gi, m;
+    while ((m = re.exec(text))) hits.push({ i: m.index, len: m[0].length });
+    if (hits.length <= max) return text;
+    var drop = hits.slice(0, hits.length - max), out = '', pos = 0;
+    drop.forEach(function (h) { out += text.slice(pos, h.i); pos = h.i + h.len; });
+    return out + text.slice(pos);
+  }
+
+  function stripYarn(text) {
+    return String(text).replace(/,?\s*\byarn\b/gi, '').replace(/\s+([.!?,])/g, '$1').replace(/[ \t]{2,}/g, ' ').trim();
+  }
+
+  function sprinkleYarn(text, rng) {
+    var parts = U.sentences(text);
+    if (parts.length < 2) return text;
+    for (var i = 0; i < parts.length - 1; i++) {
+      var s = parts[i];
+      if (/\byarn\b/i.test(s) || s.trim().split(/\s+/).length < 4 || (rng || Math.random)() > 0.5) continue;
+      var m = /^([\s\S]*?)([.!?…]+)(\s*)$/.exec(s);
+      if (m) parts[i] = m[1].replace(/[,;:\s]+$/, '') + ', yarn' + m[2] + m[3];
+    }
+    return parts.join('');
+  }
+
+  P.finish = function (b, text, opts) {
+    opts = opts || {};
+    if (opts.noYarn || b.isSerious()) return stripYarn(text);
+    var mode = b.cfg.yarn || 'normal';
+    var n = (text.match(YARN_RE) || []).length, out = text;
+    if (n === 0) {
+      if (mode !== 'low' || U.chance(0.5, b.rng)) out = appendYarn(out);
+    } else if (n > 3) out = limitYarn(out, 3);
+    if (mode === 'high') out = sprinkleYarn(out, b.rng);
+    return out;
+  };
+
+  /* ---------- text the voice can read ---------- */
+  P.voiceText = function (text) {
+    return String(text)
+      .replace(/\*[^*]*\*/g, ' ')
+      .replace(/[:;]['-]?[()DPp]+/g, ' ')
+      .replace(/(\d+)\s*\/\s*(\d+)/g, '$1 sa $2')
+      .replace(/Ate\/Kuya/g, 'Ate o Kuya')
+      .replace(/×/g, ' times ').replace(/÷/g, ' divided by ').replace(/²/g, ' squared ')
+      .replace(/π/g, ' pi ').replace(/≈/g, ' approximately ').replace(/°/g, ' degrees ')
+      .replace(/\s=\s/g, ' equals ').replace(/\s\+\s/g, ' plus ')
+      .replace(/(\d)%/g, '$1 percent')
+      .replace(/…|\.\.\./g, ', ')
+      .replace(/\s*[—–]\s*/g, ', ')
+      .replace(/[()"]/g, ' ')
+      .replace(/\s*,(\s*,)+/g, ',')
+      .replace(/\s+([,.!?])/g, '$1')
+      .replace(/\s+/g, ' ')
+      .replace(/^[\s,.]+/, '')
+      .trim();
+  };
+
+  P._appendYarn = appendYarn;
+  P._limitYarn = limitYarn;
+  P._stripYarn = stripYarn;
+  L.Persona = P;
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/engine/brain.js ===== */
+/* Leon Offline — brain.js
+ * Leon's dialogue manager. Everything runs on the device: no API, no network.
+ *
+ *   var brain = new Leon.Brain({ config: {...}, storage: Leon.Util.makeStorage() });
+ *   var reply = brain.respond('pagod ako');      // { intent, beats:[...], mood:{...} }
+ *   var idle  = brain.tick();                    // call about once a second: boredom, sleep
+ *   brain.onMute(); brain.onUnmute();            // the mute-button emotional emergency
+ *
+ * A "beat" is one thing Leon does:  { text, voice, expr, gesture, sfx, style, delay, hold, silent, action }
+ * The UI (src/ui/stage.js) plays beats in order: face, body gesture, sound, speech, lip-sync.  */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  var U = L.Util, P = L.Persona, S = L.Safety, N = L.NLU, C = L.Calc;
+
+  var DEFAULTS = {
+    region: 'PH',            // picks crisis resources in Leon.Safety.resources
+    profanity: 'on',         // 'on' | 'off'  (off = kid-safe: putragis & co become "hay naku")
+    honorific: 'auto',       // 'auto' | 'always' | 'never'   (po / opo)
+    call: 'auto',            // 'auto' | 'kuya' | 'ate' | 'boss' | 'bes' | 'pare' | 'sir' | "ma'am"
+    yarn: 'normal',          // 'low' | 'normal' | 'high'
+    boredom: 'casual',       // 'off' | 'demo' | 'casual' | 'chill'
+    sleepHours: [22, 6],     // Leon dozes off when you are idle in these hours; null = never
+    muteDrama: 'full',       // 'full' | 'short' | 'off'
+    maxScreams: 2,           // boredom screams per session
+    askQuestions: true,      // Leon may ask (politely) where you are from, favourite food...
+    seed: null               // number = deterministic (tests)
+  };
+
+  /* seconds of idle time before boredom stage 1..5 */
+  var BOREDOM = {
+    off: null,
+    demo: [25, 50, 75, 100, 125],
+    casual: [120, 240, 360, 480, 600],
+    chill: [300, 600, 900, 1200, 1500]
+  };
+
+  var DAYS = ['Linggo', 'Lunes', 'Martes', 'Miyerkules', 'Huwebes', 'Biyernes', 'Sabado'];
+  var MONTHS = ['Enero', 'Pebrero', 'Marso', 'Abril', 'Mayo', 'Hunyo', 'Hulyo', 'Agosto', 'Setyembre', 'Oktubre', 'Nobyembre', 'Disyembre'];
+
+  function lines() { return L.Data.lines; }
+  function pad(n) { return n < 10 ? '0' + n : '' + n; }
+
+  function Brain(opts) {
+    opts = opts || {};
+    this.cfg = U.deepMerge(DEFAULTS, opts.config || {});
+    this.rng = U.makeRng(this.cfg.seed);
+    this.storage = opts.storage || U.makeStorage('leon:');
+    this._now = opts.now || function () { return Date.now(); };
+    this.state = this._load();
+    var t = this._now();
+    this.session = {
+      startedAt: t, lastInteraction: t, boredStage: 0, muted: false, quiet: false, asleep: false,
+      muteShownAt: 0, muteShows: 0, screams: 0, pending: null, lastContent: null, recent: {},
+      longReplies: 0, pokes: 0, lastPokeAt: 0, turnsSinceAsk: 0, seriousTurns: 0, gentleTurns: 0,
+      crisis: false, crisisTurns: 0, usedPo: false, autoCall: null, lastBoredAt: t
+    };
+    this._curseCount = 0;
+    this._curseMax = 1;
+  }
+
+  /* ---------------- persistence ---------------- */
+  Brain.prototype._fresh = function () {
+    return {
+      v: 1,
+      profile: { name: null, call: null, hometown: null, food: null, job: null, stress: null, stressAt: 0, usedPo: false, lastSeen: 0, sessions: 0 },
+      mood: { trust: 10 },
+      flags: { introduced: false, noAsk: {} },
+      counters: { turns: 0, jokes: 0, mutes: 0, screams: 0 }
+    };
+  };
+  Brain.prototype._load = function () {
+    var s = this.storage.get('state');
+    return (s && s.v === 1) ? U.deepMerge(this._fresh(), s) : this._fresh();
+  };
+  Brain.prototype._save = function () { this.storage.set('state', this.state); };
+  Brain.prototype.resetMemory = function () { this.state = this._fresh(); this._save(); };
+  Brain.prototype.setConfig = function (partial) { this.cfg = U.deepMerge(this.cfg, partial || {}); return this.cfg; };
+  Brain.prototype.snapshot = function () {
+    return { cfg: this.cfg, state: U.clone(this.state), session: { boredStage: this.session.boredStage, muted: this.session.muted, quiet: this.session.quiet, asleep: this.session.asleep, serious: this.session.seriousTurns, gentle: this.session.gentleTurns, crisis: this.session.crisis, pending: this.session.pending } };
+  };
+
+  /* ---------------- modes ---------------- */
+  Brain.prototype.isSerious = function () { return this.session.seriousTurns > 0 || this.session.crisis; };
+  Brain.prototype.isGentle = function () { return this.session.gentleTurns > 0 || this.isSerious(); };
+  Brain.prototype._isSleepHour = function (h) {
+    var sh = this.cfg.sleepHours;
+    if (!sh || sh.length < 2) return false;
+    return sh[0] > sh[1] ? (h >= sh[0] || h < sh[1]) : (h >= sh[0] && h < sh[1]);
+  };
+  Brain.prototype._trust = function (d) { this.state.mood.trust = U.clamp(this.state.mood.trust + d, 0, 100); };
+
+  /* ---------------- beat + reply builders ---------------- */
+  Brain.prototype._begin = function () { this._curseCount = 0; this._curseMax = 1; };
+
+  Brain.prototype._b = function (text, expr, o) {
+    o = o || {};
+    var raw = o.raw ? String(text) : P.fmt(this, text, o.vars);
+    var shown = o.noYarn || o.action ? (o.noYarn ? P._stripYarn(raw) : raw) : P.finish(this, raw, o);
+    var beat = { text: shown, expr: expr || 'happy' };
+    if (!/yarn/i.test(raw) && /yarn/i.test(shown)) beat._auto = true;      /* yarn we added (not authored): may be thinned later */
+    ['gesture', 'sfx', 'style', 'delay', 'hold', 'silent', 'mouth', 'fx'].forEach(function (k) { if (o[k] !== undefined) beat[k] = o[k]; });
+    if (o.action) beat.action = true;
+    beat.voice = (o.action || o.speak === false) ? '' : P.voiceText(shown);
+    return beat;
+  };
+
+  Brain.prototype._reply = function (beats, intent, extra) {
+    /* a reply made of several beats does not need "yarn" on every middle beat */
+    var self = this, last = beats.length - 1;
+    beats.forEach(function (bt, i) {
+      if (bt._auto && i > 0 && i < last && U.chance(0.5, self.rng)) { bt.text = P._stripYarn(bt.text); if (bt.voice) bt.voice = P.voiceText(bt.text); }
+      delete bt._auto;
+    });
+    var r = {
+      intent: intent, beats: beats,
+      mood: { serious: this.isSerious(), gentle: this.isGentle(), trust: this.state.mood.trust, quiet: this.session.quiet, muted: this.session.muted }
+    };
+    if (extra) for (var k in extra) r[k] = extra[k];
+    this._save();
+    return r;
+  };
+
+  Brain.prototype._say = function (key, bank, extra, opts) { return P.say(this, key, bank, extra, opts); };
+
+  /* ---------------- startup greeting ---------------- */
+  Brain.prototype._greetBeats = function () {
+    var now = this._now(), h = new Date(now).getHours(), part = U.dayPart(h), G = lines().greet, st = this.state, key, pool;
+    if (!st.flags.introduced) { key = 'first'; pool = G.first; st.flags.introduced = true; }
+    else if (st.profile.name && U.chance(0.6, this.rng)) { key = 'returning'; pool = G.returning; }
+    else { key = part; pool = G[part]; }
+    var beats = [this._b(this._say('greet.' + key, pool), part === 'night' ? 'sleepy' : 'cheerful', { gesture: 'wave' })];
+    if (st.profile.stress && now - st.profile.stressAt < 36 * 3600 * 1000 && !this.isSerious()) {
+      beats.push(this._b(this._say('greet.stress', G.stress), 'thinking', { delay: 1400 }));
+      st.profile.stress = null;
+    }
+    return beats;
+  };
+
+  Brain.prototype.start = function () {
+    this._begin();
+    var now = this._now();
+    this.state.profile.sessions++;
+    var beats = this._greetBeats();
+    this.state.profile.lastSeen = now;
+    this.session.lastInteraction = now;
+    return this._reply(beats, 'start');
+  };
+
+  /* ---------------- the main entry: a message from the person ---------------- */
+  Brain.prototype.respond = function (text) {
+    this._begin();
+    var s = this.session, st = this.state, now = this._now();
+    var raw = String(text == null ? '' : text).trim();
+    if (s.seriousTurns > 0) s.seriousTurns--;
+    if (s.gentleTurns > 0) s.gentleTurns--;
+    s.lastInteraction = now; s.boredStage = 0; s.turnsSinceAsk++;
+    st.counters.turns++;
+    this._trust(1);
+
+    if (!raw) return this._reply([this._b("Uy, wala kang sinabi. Okay lang, tahimik din ako minsan. Charot, hindi, yarn.", 'confused', { gesture: 'shrug' })], 'empty');
+    var norm = U.normalize(raw);
+
+    /* 1. read the room: safety before everything else */
+    var sa = S.assess(raw);
+    if (sa.level > 0) return this._safetyReply(sa.level);
+    if (s.crisis) return this._crisisFollowup(norm);
+
+    /* 2. learn tiny facts (name, hometown, favourite food, job, "po") */
+    var ex = N.extract(raw);
+    if (ex.usedPo) { s.usedPo = true; st.profile.usedPo = true; }
+    var learned = this._learn(ex);
+
+    var prefix = [];
+    if (s.asleep) { s.asleep = false; prefix.push(this._b(this._say('sleepy.wake', lines().sleepy.wake), 'surprised', { gesture: 'hop' })); }
+
+    /* 3. real silence request is always honoured */
+    if (N.wantsQuiet(norm)) return this.requestQuiet({ real: N.quietIsReal(norm) });
+    if (s.quiet) { s.quiet = false; prefix.push(this._b(lines().quiet.wake, 'shy', { style: 'whisper', gesture: 'wave' })); }
+
+    /* 4. answer to a question Leon asked earlier */
+    if (s.pending) {
+      var pr = this._pending(raw, norm, ex);
+      if (pr) { if (prefix.length) pr.beats = prefix.concat(pr.beats); return pr; }
+    }
+
+    /* 5. rule-based skills: calculator, clock */
+    var calc = C.parse(raw);
+    if (calc) return this._withPrefix(prefix, this._reply(this._calcBeats(calc), 'calc'));
+    if (/\b(what time|anong oras|ano na oras|oras na ba|what is the time|what date|what day|anong araw|ano ang petsa|date today|petsa ngayon|what is today)\b/.test(norm)) {
+      return this._withPrefix(prefix, this._reply(this._timeBeats(norm), 'time'));
+    }
+
+    /* 6. understand + answer */
+    var it = N.intent(raw), label = it.label;
+    if (N.isLaugh(raw, norm)) label = 'laugh';
+    else if (s.pending === null && (N.isYes(norm) || N.isNo(norm)) && label !== 'yes' && label !== 'no') label = N.isYes(norm) ? 'yes' : 'no';
+
+    if (learned.name || learned.call) {
+      if (label === 'unknown' || label === 'greeting' || label === 'yes') {
+        var nb = learned.name ? this._say('name_set', lines().name_set) : this._say('call_set', lines().call_set);
+        return this._withPrefix(prefix, this._reply([this._b(nb, 'happy', { gesture: 'wave' })], 'learn'));
+      }
+    }
+    if ((learned.hometown || learned.food || learned.job) && (label === 'unknown' || label === 'greeting')) {
+      var k = learned.hometown ? 'hometown' : (learned.food ? 'food' : 'job');
+      return this._withPrefix(prefix, this._reply([this._b(this._say('ask.reflect.' + k, lines().ask.reflect[k]), 'cheerful', { gesture: 'nod' })], 'learn'));
+    }
+
+    var isQ = N.isQuestion(raw, norm), kb = null;
+    if (label === 'science_question' || label === 'unknown' || isQ) kb = N.kb(raw, label === 'science_question' ? N.cfg.kbFromIntent : N.cfg.kbMin);
+    var beats, intent = label;
+    if (kb && (label === 'science_question' || label === 'unknown' || kb.score >= 0.6)) {
+      beats = this._scienceBeats(kb.entry); intent = 'science';
+    } else {
+      var fn = this['_h_' + label];
+      beats = fn ? fn.call(this, { raw: raw, norm: norm, ex: ex, it: it, isQ: isQ }) : this._h_unknown({ raw: raw, norm: norm, isQ: isQ });
+    }
+    var reply = Array.isArray(beats) ? this._reply(beats, intent, { confidence: it.score }) : beats;
+    this._decorate(reply, label);
+    return this._withPrefix(prefix, reply);
+  };
+
+  Brain.prototype._withPrefix = function (prefix, reply) {
+    if (prefix && prefix.length) reply.beats = prefix.concat(reply.beats);
+    return reply;
+  };
+
+  /* small extras that make Leon feel like a person: self-correction, polite curiosity */
+  Brain.prototype._decorate = function (reply, label) {
+    var s = this.session, L2 = lines();
+    if (this.isGentle() || s.pending || reply.intent === 'quiet') return;
+    var chars = reply.beats.reduce(function (n, b) { return n + (b.text || '').length; }, 0);
+    if (chars > 230 || (++s.longReplies % 6 === 0 && U.chance(0.5, this.rng))) {
+      if (U.chance(0.55, this.rng)) reply.beats.push(this._b(this._say('self_correct', L2.self_correct), 'embarrassed', { delay: 1600, gesture: 'shrug' }));
+    }
+    var chatty = { greeting: 1, how_are_you: 1, thanks: 1, laugh: 1, user_bored: 1, compliment: 1, joke_request: 1, quote_request: 1, fact_request: 1 };
+    var lastBeat = reply.beats[reply.beats.length - 1];
+    var endsWithQuestion = lastBeat && /\?\s*$/.test(lastBeat.text || '');
+    if (this.cfg.askQuestions && chatty[label] && s.turnsSinceAsk >= 6 && !endsWithQuestion) {
+      var p = this.state.profile, topics = ['hometown', 'food', 'job'].filter(function (t) { return !p[t] && !this.state.flags.noAsk[t]; }, this);
+      if (topics.length) {
+        var topic = U.pick(topics, this.rng);
+        s.pending = { type: 'ask_permission', topic: topic };
+        s.turnsSinceAsk = 0;
+        reply.beats.push(this._b(this._say('ask.permission', L2.ask.permission), 'shy', { delay: 1800 }));
+      }
+    }
+  };
+
+  Brain.prototype._learn = function (ex) {
+    var p = this.state.profile, got = {};
+    ['name', 'call', 'hometown', 'food', 'job'].forEach(function (k) { if (ex[k] && p[k] !== ex[k]) { p[k] = ex[k]; got[k] = true; } });
+    if (ex.stress) { p.stress = ex.stress; p.stressAt = this._now(); }
+    return got;
+  };
+
+  /* ---------------- safety ---------------- */
+  Brain.prototype._safetyReply = function (level) {
+    var s = this.session, self = this;
+    s.seriousTurns = 6; s.pending = null; s.boredStage = 0;
+    if (level >= 2) { s.crisis = true; s.crisisTurns = 0; }
+    var beats = S.script(level, this.cfg, this.rng).map(function (d) {
+      return self._b(d.text, d.expr, { raw: true, noYarn: true, style: d.style, delay: d.delay });
+    });
+    return this._reply(beats, level >= 2 ? 'crisis' : 'crisis_soft', { safety: level });
+  };
+
+  Brain.prototype._crisisFollowup = function (norm) {
+    var s = this.session, beats = [];
+    s.crisisTurns++;
+    var better = /\b(salamat|thanks|thank you|okay na|ok na|mas okay na|ayos na|gumaan)\b/.test(norm);
+    if (better) {
+      s.crisis = false;
+      beats.push(this._b("Salamat sa pagkwento. Natutuwa akong gumaan kahit konti. Nandito pa rin ako, at kung bumigat ulit, abutin mo ang taong pinagkakatiwalaan mo o ang hotline.", 'sad', { raw: true, noYarn: true, style: 'soft' }));
+    } else {
+      beats.push(this._b(S.followups[(s.crisisTurns - 1) % S.followups.length], 'sad', { raw: true, noYarn: true, style: 'soft' }));
+      if (s.crisisTurns % 2 === 0) beats.push(this._b(S.resourceLine(this.cfg) + '.', 'hurt', { raw: true, noYarn: true, style: 'soft', delay: 800 }));
+    }
+    if (s.crisisTurns >= 10) s.crisis = false;
+    s.seriousTurns = Math.max(s.seriousTurns, 3);
+    return this._reply(beats, 'crisis_followup');
+  };
+
+  /* ---------------- pending questions ---------------- */
+  Brain.prototype._pending = function (raw, norm, ex) {
+    var s = this.session, st = this.state, p = s.pending, yes = N.isYes(norm), no = N.isNo(norm), L2 = lines();
+    function clear() { s.pending = null; }
+    switch (p.type) {
+      case 'comfort_or_explain': {
+        clear();
+        var comfort = /\b(comfort|alaga|yakap|makinig|listen|kwento|vent)\b/.test(norm);
+        var explain = /\b(explain|explanation|tips?|advice|solusyon|solution|solve|ayusin|paano)\b/.test(norm);
+        if (/\b(salamat|thanks|thank you|okay na|ok na|ayos na)\b/.test(norm)) { s.seriousTurns = Math.min(s.seriousTurns, 1); return null; }
+        if (no) return this._reply([this._b("Sige. Nandito lang ako.", 'sad', { noYarn: true, style: 'soft' })], 'sad_idle');
+        if (/\b(joke|patawa|tawa)\b/.test(norm)) { s.seriousTurns = 0; s.gentleTurns = 2; return this._reply(this._jokeBeats(null), 'joke_request'); }
+        if (explain && !comfort) return this._reply(this._seqBeats(this._say('sad.explain', L2.sad.explain), 'thinking', { noYarn: true, style: 'soft' }), 'sad_explain');
+        if (comfort || yes) return this._reply(this._seqBeats(this._say('sad.comfort', L2.sad.comfort), 'sad', { noYarn: true, style: 'soft' }), 'sad_comfort');
+        return this._reply([this._b(this._say('sad.story', L2.sad.story), 'sad', { noYarn: true, style: 'soft' })], 'sad_story');
+      }
+      case 'ask_permission': {
+        if (yes) { s.pending = { type: 'ask_value', topic: p.topic }; return this._reply([this._b(this._say('ask.q.' + p.topic, L2.ask.q[p.topic]), 'thinking', { gesture: 'nod' })], 'ask'); }
+        if (no) { clear(); st.flags.noAsk[p.topic] = true; return this._reply([this._b(this._say('ask.permission_no', L2.ask.permission_no), 'shy')], 'ask_no'); }
+        clear(); return null;
+      }
+      case 'ask_value': {
+        clear();
+        if (no) { st.flags.noAsk[p.topic] = true; return this._reply([this._b(this._say('ask.permission_no', L2.ask.permission_no), 'shy')], 'ask_no'); }
+        if (/\?/.test(raw)) return null;
+        var val = this._parseValue(p.topic, raw, ex);
+        if (!val) return null;
+        st.profile[p.topic] = val;
+        this._trust(2);
+        return this._reply([this._b(this._say('ask.reflect.' + p.topic, L2.ask.reflect[p.topic]), 'cheerful', { gesture: 'nod' })], 'learn');
+      }
+      case 'roast_check': {
+        clear();
+        if (no || /\b(sobra|too much|tama na|stop|ouch|aray|masakit)\b/.test(norm)) {
+          this._trust(-5); s.seriousTurns = 1;
+          return this._reply([this._b(this._say('roast_stop', L2.roast_stop), 'embarrassed', { noYarn: true })], 'roast_stop');
+        }
+        if (yes || N.isLaugh(raw, norm) || /\b(okay lang|ok lang|ayos lang|sige pa|go|haha)\b/.test(norm)) {
+          this._trust(6);
+          return this._reply([this._b(this._say('roast_ok', L2.roast_ok), 'laughing', { sfx: 'giggle', gesture: 'bounce' })], 'roast_ok');
+        }
+        return null;
+      }
+      case 'louder_or_quieter': {
+        clear();
+        if (/\b(tahimik|quiet|silence|manahimik)\b/.test(norm)) return this.requestQuiet({ real: false });
+        if (yes || /\b(volume|lower|okay lang|ok lang|ayos)\b/.test(norm)) return this._reply([this._b(this._say('volume_low', L2.volume_low), 'shy', { style: 'soft' })], 'volume_low');
+        return null;
+      }
+      case 'anxiety_scale': {
+        clear();
+        var m = /\b(10|[1-9])\b/.exec(norm), n = m ? parseInt(m[1], 10) : (/\b(mataas|high|grabe|sobra)\b/.test(norm) ? 8 : (/\b(mababa|low|konti|kaunti)\b/.test(norm) ? 3 : null));
+        if (n === null) { if (no) return null; return this._reply([this._b(this._say('anxious.noscale', L2.anxious.noscale), 'shy')], 'anxious_scale'); }
+        var key = n >= 7 ? 'high' : (n >= 4 ? 'mid' : 'low');
+        return this._reply([this._b(this._say('anxious.' + key, L2.anxious[key], { n: n }), 'thinking', { gesture: 'nod' })], 'anxious_scale');
+      }
+    }
+    clear();
+    return null;
+  };
+
+  Brain.prototype._parseValue = function (topic, raw, ex) {
+    if (ex[topic]) return ex[topic];
+    var t = String(raw).replace(/[.!?]+$/, '').trim();
+    if (!t || t.length > 40) return null;
+    if (topic === 'hometown') {
+      t = t.replace(/^(?:taga[\s-]*|from\s+|sa\s+|galing\s+(?:ako\s+)?sa\s+|i'?m from\s+)/i, '').replace(/\s+(?:po|ako|lang|naman)$/i, '').trim();
+      return t ? U.titleCase(t) : null;
+    }
+    if (topic === 'food') return t.toLowerCase().replace(/^(?:paborito ko ang |gusto ko ng |favorite ko ang |paborito ko )/, '').trim() || null;
+    if (topic === 'job') return t.toLowerCase().replace(/^(?:ako ay |i work as |i am |im |ako po ay )(?:an? )?/, '').trim() || null;
+    return null;
+  };
+
+  /* sequences: ['line 1', 'line 2', ...] -> beats with natural pauses */
+  Brain.prototype._seqBeats = function (arr, expr, o) {
+    var self = this, base = o || {};
+    return (arr || []).map(function (t, i) {
+      var opts = {}; for (var k in base) opts[k] = base[k];
+      if (i > 0) opts.delay = 900;
+      return self._b(t, expr, opts);
+    });
+  };
+
+  /* ---------------- calculator + clock ---------------- */
+  Brain.prototype._calcBeats = function (c) {
+    var L2 = lines().calc;
+    if (c.kind === 'error') return [this._b(this._say('calc.' + c.code, L2[c.code]), 'surprised', { gesture: 'shake' })];
+    if (c.kind === 'split') {
+      var v = { per: c.text.per, perCeil: c.text.perCeil, people: c.people, grand: c.text.grand };
+      var beats = [this._b(this._say('calc.split', L2.split, v), 'nerd', { gesture: 'nod', vars: v })];
+      if (c.text.per !== c.text.perCeil) beats.push(this._b(this._say('calc.split_round', L2.split_round, v), 'proud', { delay: 900, vars: v }));
+      return beats;
+    }
+    var vars = { expr: c.expr, result: c.text };
+    return [this._b(this._say('calc.expr', L2.expr, vars), 'nerd', { gesture: 'nod', vars: vars })];
+  };
+
+  Brain.prototype._timeBeats = function (norm) {
+    var d = new Date(this._now()), h = d.getHours(), m = d.getMinutes(), h12 = h % 12 || 12;
+    var part = h >= 5 && h < 11 ? 'umaga' : (h >= 11 && h < 13 ? 'tanghali' : (h >= 13 && h < 17 ? 'hapon' : 'gabi'));
+    var wantsDate = /\b(date|day|araw|petsa|today)\b/.test(norm) && !/\b(time|oras)\b/.test(norm);
+    if (wantsDate) {
+      var dv = { day: DAYS[d.getDay()], month: MONTHS[d.getMonth()], date: d.getDate(), year: d.getFullYear() };
+      return [this._b(this._say('date', lines().date, dv), 'cheerful', { gesture: 'nod', vars: dv })];
+    }
+    var tv = { alas: h12 === 1 ? 'Ala-' : 'Alas-', time: h12 + ':' + pad(m), part: part };
+    return [this._b(this._say('time', lines().time, tv), 'thinking', { gesture: 'nod', vars: tv })];
+  };
+
+  /* ---------------- science / content ---------------- */
+  Brain.prototype._scienceBeats = function (e) {
+    var L2 = lines(), beats = [], s = this.session;
+    s.lastContent = 'science';
+    if (e.unknown) {
+      beats.push(this._b("AAAAH!", 'excited', { sfx: 'scream', gesture: 'scream', style: 'shout', speak: false, noYarn: true }));
+      beats.push(this._b(e.a, 'nerd', { delay: 900, gesture: 'nod' }));
+      beats.push(this._b(this._say('science_unknown_post', L2.science_unknown_post), 'embarrassed', { delay: 1200 }));
+      return beats;
+    }
+    beats.push(this._b(e.a, 'nerd', { gesture: 'nod' }));
+    if (U.chance(0.35, this.rng)) beats.push(this._b(this._say('science_tail', L2.science_tail), 'wink', { delay: 1000 }));
+    return beats;
+  };
+
+  Brain.prototype._jokeBeats = function (topic) {
+    var L2 = lines(), s = this.session, beats = [];
+    var pool = L.Data.jokes.filter(function (j) { return !topic || j.tag === topic; });
+    if (!pool.length) pool = L.Data.jokes;
+    var j = P.pick(this, 'joke.' + (topic || 'any'), pool, { raw: true });
+    s.lastContent = 'joke'; this.state.counters.jokes++;
+    if (U.chance(0.35, this.rng)) beats.push(this._b(this._say('joke_intro', L2.joke_intro), 'cheerful', { gesture: 'wave' }));
+    beats.push(this._b(j.t, 'wink', { gesture: 'bounce', delay: beats.length ? 700 : 0 }));
+    if (j.ex && U.chance(0.4, this.rng)) beats.push(this._b('Explain ko lang: ' + j.ex, 'thinking', { delay: 1500, gesture: 'nod' }));
+    else beats.push(this._b(this._say('joke_tail', L2.joke_tail), 'laughing', { delay: 1300, sfx: 'giggle', gesture: 'bounce' }));
+    return beats;
+  };
+
+  Brain.prototype._quoteBeats = function () {
+    var L2 = lines(), s = this.session, beats = [];
+    var q = P.pick(this, 'quote', L.Data.quotes);
+    s.lastContent = 'quote';
+    beats.push(this._b(this._say('quote_intro', L2.quote_intro), 'cool', { gesture: 'nod' }));
+    beats.push(this._b(q, 'proud', { delay: 900, gesture: 'nod' }));
+    if (U.chance(0.5, this.rng)) beats.push(this._b(this._say('quote_tail', L2.quote_tail), 'wink', { delay: 1500 }));
+    return beats;
+  };
+
+  Brain.prototype._factBeats = function () {
+    var L2 = lines(), s = this.session, beats = [];
+    var f = P.pick(this, 'fact', L.Data.facts);
+    var intro = this._say('fact_intro', L2.fact_intro);
+    s.lastContent = 'fact';
+    var text = /,$/.test(intro) ? intro + ' ' + f : intro + ' ' + f.charAt(0).toUpperCase() + f.slice(1);
+    beats.push(this._b(text, 'nerd', { gesture: 'nod' }));
+    if (U.chance(0.4, this.rng)) beats.push(this._b(this._say('fact_tail', L2.fact_tail), 'excited', { delay: 1400, gesture: 'hop' }));
+    return beats;
+  };
+
+  /* ---------------- intent handlers ---------------- */
+  Brain.prototype._h_greeting = function () { return this._greetBeats(); };
+
+  Brain.prototype._h_farewell = function () { return [this._b(this._say('farewell', lines().farewell), 'goodbye', { gesture: 'wave' })]; };
+  Brain.prototype._h_goodnight = function () { return [this._b(this._say('goodnight', lines().goodnight), 'sleepy', { gesture: 'wave' })]; };
+  Brain.prototype._h_thanks = function () { return [this._b(this._say('thanks', lines().thanks), 'shy', { gesture: 'wiggle' })]; };
+  Brain.prototype._h_how_are_you = function () { return [this._b(this._say('how_are_you', lines().how_are_you), 'happy', { gesture: 'bounce' })]; };
+  Brain.prototype._h_doing = function () { return [this._b(this._say('doing', lines().doing), 'thinking', { gesture: 'nod' })]; };
+
+  Brain.prototype._h_feel_sad = function () {
+    var s = this.session, L2 = lines().sad;
+    s.seriousTurns = 5; s.pending = { type: 'comfort_or_explain' };
+    return [
+      this._b(this._say('sad.presence', L2.presence), 'sad', { noYarn: true, style: 'soft' }),
+      this._b(this._say('sad.ask', L2.ask), 'hurt', { noYarn: true, style: 'soft', delay: 1100 })
+    ];
+  };
+  Brain.prototype._h_feel_tired = function (c) {
+    this.session.gentleTurns = 3;
+    if (c.ex && c.ex.stress) { this.state.profile.stress = c.ex.stress; this.state.profile.stressAt = this._now(); }
+    var seq = this._say('tired', lines().tired);
+    return [this._b(seq[0], 'tired', { gesture: 'sit' }), this._b(seq[1], 'cheerful', { delay: 1300 })];
+  };
+  Brain.prototype._h_feel_anxious = function (c) {
+    var s = this.session, seq = this._say('anxious.open', lines().anxious.open);
+    s.gentleTurns = 4; s.pending = { type: 'anxiety_scale' };
+    if (c.ex && c.ex.stress) { this.state.profile.stress = c.ex.stress; this.state.profile.stressAt = this._now(); }
+    return [this._b(seq[0], 'shy', { gesture: 'nod' }), this._b(seq[1], 'thinking', { delay: 1400 })];
+  };
+  Brain.prototype._h_feel_angry = function () {
+    this.session.gentleTurns = 3;
+    return [this._b(this._say('angry', lines().angry), 'angry', { gesture: 'shake' })];
+  };
+  Brain.prototype._h_feel_happy = function () {
+    this._trust(1);
+    return [this._b(this._say('happy', lines().happy), 'excited', { gesture: 'hop', sfx: 'giggle' })];
+  };
+  Brain.prototype._h_user_bored = function () { return [this._b(this._say('user_bored', lines().user_bored), 'cheerful', { gesture: 'bounce' })]; };
+
+  Brain.prototype._h_joke_request = function (c) { this.session.seriousTurns = 0; return this._jokeBeats(N.topic(c.norm)); };
+  Brain.prototype._h_quote_request = function () { return this._quoteBeats(); };
+  Brain.prototype._h_fact_request = function () { return this._factBeats(); };
+  Brain.prototype._h_science_question = function () {
+    return [this._b(this._say('science_not_found', lines().science_not_found), 'confused', { gesture: 'shrug' })];
+  };
+
+  Brain.prototype._h_roast_me = function () {
+    var L2 = lines(), s = this.session, high = this.state.mood.trust >= 40 && U.chance(0.6, this.rng);
+    s.pending = { type: 'roast_check' };
+    return [
+      this._b(this._say(high ? 'roast.high' : 'roast.low', high ? L2.roast.high : L2.roast.low), 'wink', { gesture: 'bounce' }),
+      this._b(this._say('roast_tail', L2.roast_tail), 'shy', { delay: 1500 })
+    ];
+  };
+  Brain.prototype._h_compliment = function () { this._trust(2); return [this._b(this._say('compliment', lines().compliment), 'shy', { gesture: 'wiggle' })]; };
+  Brain.prototype._h_insult_mild = function () {
+    var seq = this._say('insult_mild', lines().insult_mild);
+    this.session.gentleTurns = 2; this.session.pending = { type: 'louder_or_quieter' };
+    return [this._b(seq[0], 'embarrassed', { gesture: 'shrug' }), this._b(seq[1], 'sad', { delay: 1300 })];
+  };
+  Brain.prototype._h_insult_harsh = function () {
+    var seq = this._say('insult_harsh', lines().insult_harsh);
+    this._trust(-3); this.session.gentleTurns = 3;
+    return [this._b(seq[0], 'hurt', { gesture: 'sit' }), this._b(seq[1], 'sad', { delay: 1500, style: 'soft' })];
+  };
+  Brain.prototype._h_food_hungry = function () {
+    var h = new Date(this._now()).getHours(), F = lines().food;
+    var part = h >= 5 && h < 10 ? 'breakfast' : (h >= 10 && h < 14 ? 'lunch' : (h >= 14 && h < 17 ? 'merienda' : (h >= 17 && h < 21 ? 'dinner' : 'late')));
+    var beats = [this._b(this._say('food.' + part, F[part]), 'hungry', { gesture: 'bounce' })];
+    if (this.state.profile.food && U.chance(0.6, this.rng)) beats.push(this._b(this._say('food.known', F.known), 'cheerful', { delay: 1400 }));
+    return beats;
+  };
+  Brain.prototype._h_identity = function () { return [this._b(this._say('identity', lines().identity), 'proud', { gesture: 'wave' })]; };
+  Brain.prototype._h_ask_ai = function () { return [this._b(this._say('ask_ai', lines().ask_ai), 'wink', { gesture: 'nod' })]; };
+  Brain.prototype._h_what_is_yarn = function () { return [this._b(this._say('what_is_yarn', lines().what_is_yarn), 'wink', { gesture: 'wiggle' })]; };
+  Brain.prototype._h_about_offline = function () { return [this._b(this._say('about_offline', lines().about_offline), 'cool', { gesture: 'nod' })]; };
+  Brain.prototype._h_capabilities = function () { return [this._b(this._say('capabilities', lines().capabilities), 'cheerful', { gesture: 'bounce' })]; };
+  Brain.prototype._h_love_you = function () { this._trust(2); return [this._b(this._say('love_you', lines().love_you), 'love', { gesture: 'wiggle', sfx: 'giggle' })]; };
+  Brain.prototype._h_apology = function () { return [this._b(this._say('apology', lines().apology), 'shy', { gesture: 'nod' })]; };
+  Brain.prototype._h_realtime_info = function () { return [this._b(this._say('realtime', lines().realtime), 'thinking', { gesture: 'shrug' })]; };
+  Brain.prototype._h_laugh = function () {
+    var s = this.session;
+    this._trust(3);
+    if (this.isSerious()) { s.seriousTurns = 0; s.gentleTurns = 2; return [this._b(this._say('sad.cheer', lines().sad.cheer), 'happy', { gesture: 'wiggle' })]; }
+    return [this._b(this._say('laugh', lines().laugh), 'laughing', { gesture: 'bounce', sfx: 'giggle' })];
+  };
+  Brain.prototype._h_yes = function () { return [this._b(this._say('yes_idle', lines().yes_idle), 'cheerful', { gesture: 'nod' })]; };
+  Brain.prototype._h_no = function () { return [this._b(this._say('no_idle', lines().no_idle), 'shy')]; };
+  Brain.prototype._h_again = function (c) {
+    var last = this.session.lastContent;
+    if (last === 'joke') return this._jokeBeats(null);
+    if (last === 'quote') return this._quoteBeats();
+    if (last === 'fact' || last === 'science') return this._factBeats();
+    return [this._b(this._say('again_none', lines().again_none), 'confused', { gesture: 'shrug' })];
+  };
+  Brain.prototype._h_mute_threat = function () {
+    var L2 = lines();
+    return [
+      this._b(this._say('mute_threat', L2.mute_threat), 'begging', { gesture: 'shake' }),
+      this._b(this._say('mute_threat_tail', L2.mute_threat_tail), 'scared', { delay: 1500 })
+    ];
+  };
+  Brain.prototype._h_silence_request = function (c) { return this.requestQuiet({ real: N.quietIsReal(c.norm) }); };
+  Brain.prototype._h_unknown = function (c) {
+    var L2 = lines();
+    if (c && c.isQ) return [this._b(this._say('science_not_found', L2.science_not_found), 'confused', { gesture: 'shrug' })];
+    return [this._b(this._say('unknown', L2.unknown), 'confused', { gesture: 'shrug' })];
+  };
+
+  /* ---------------- touch: the person pokes the floating dino ---------------- */
+  Brain.prototype.poke = function () {
+    this._begin();
+    var s = this.session, now = this._now(), L2 = lines();
+    s.lastInteraction = now; s.boredStage = 0;
+    if (s.quiet || s.asleep) return this.wake();
+    if (now - s.lastPokeAt > 4000) s.pokes = 0;
+    s.pokes++; s.lastPokeAt = now;
+    var tier = s.pokes >= 6 ? 'hard' : (s.pokes >= 3 ? 'medium' : 'soft');
+    var beat = this._b(this._say('poke.' + tier, L2.poke[tier]), tier === 'soft' ? 'cheerful' : (tier === 'medium' ? 'embarrassed' : 'pouty'),
+      { gesture: tier === 'soft' ? 'hop' : 'shake', sfx: tier === 'hard' ? undefined : 'giggle' });
+    return this._reply([beat], 'poke');
+  };
+
+  Brain.prototype.touch = function () { this.session.lastInteraction = this._now(); this.session.boredStage = 0; };
+
+  Brain.prototype.wake = function () {
+    this._begin();
+    var s = this.session, L2 = lines();
+    s.lastInteraction = this._now(); s.boredStage = 0;
+    if (s.quiet) { s.quiet = false; return this._reply([this._b(L2.quiet.wake, 'shy', { style: 'whisper', gesture: 'wave' })], 'wake'); }
+    if (s.asleep) { s.asleep = false; return this._reply([this._b(this._say('sleepy.wake', L2.sleepy.wake), 'surprised', { gesture: 'hop' })], 'wake'); }
+    return null;
+  };
+
+  /* ---------------- boredom, sleep ---------------- */
+  Brain.prototype.tick = function (nowMs) {
+    var s = this.session, cfg = this.cfg;
+    nowMs = nowMs || this._now();
+    var sched = BOREDOM[cfg.boredom], hour = new Date(nowMs).getHours();
+    var idle = (nowMs - s.lastInteraction) / 1000;
+    if (s.quiet) return null;
+    if (this._isSleepHour(hour)) {
+      if (!s.asleep && idle >= 90) {
+        s.asleep = true; this._begin();
+        return this._reply([this._b(this._say('sleepy.sleep', lines().sleepy.sleep), 'sleepy', { gesture: 'sit', silent: true })], 'sleep');
+      }
+      return null;
+    }
+    if (s.asleep) s.asleep = false;
+    if (!sched || this.isSerious() || this.session.pending) return null;
+    var next = s.boredStage + 1;
+    if (next > 5) {
+      if (idle >= sched[4] * 3) { s.boredStage = 0; s.lastInteraction = nowMs; }
+      return null;
+    }
+    if (idle < sched[next - 1]) return null;
+    s.boredStage = next;
+    this._begin();
+    return this._boredBeats(next);
+  };
+
+  Brain.prototype._boredBeats = function (stage) {
+    var B = lines().boredom, s = this.session, beats = [];
+    switch (stage) {
+      case 1:
+        beats.push(this._b(this._say('bored.s1', B.s1), 'pouty', { gesture: 'sit' }));
+        break;
+      case 2: {
+        var f = P.pick(this, 'fact', L.Data.facts), intro = this._say('bored.s2', B.s2_intro);
+        beats.push(this._b(/,$/.test(intro) ? intro + ' ' + f : intro + ' ' + f.charAt(0).toUpperCase() + f.slice(1), 'thinking', { gesture: 'nod' }));
+        break;
+      }
+      case 3: {
+        var q1 = P.pick(this, 'quote', L.Data.quotes), q2 = P.pick(this, 'quote', L.Data.quotes), q3 = P.pick(this, 'quote', L.Data.quotes);
+        beats.push(this._b(this._say('bored.s3', B.s3_intro), 'cool', { gesture: 'nod' }));
+        beats.push(this._b(q1, 'proud', { delay: 900 }));
+        beats.push(this._b(q2, 'cheerful', { delay: 2600, gesture: 'bounce' }));
+        beats.push(this._b(q3, 'wink', { delay: 2600, gesture: 'wiggle' }));
+        break;
+      }
+      case 4:
+        beats.push(this._b(this._say('bored.s4', B.s4), 'angry', { gesture: 'legbounce' }));
+        beats.push(this._b("*tap tap tap*", 'pouty', { action: true, gesture: 'pace', delay: 1800 }));
+        break;
+      default:
+        if (s.screams >= this.cfg.maxScreams) {
+          beats.push(this._b(this._say('bored.s5_denied', B.s5_denied), 'tired', { gesture: 'sit' }));
+        } else {
+          s.screams++; this.state.counters.screams++;
+          beats.push(this._b("AHHHHHH!", 'angry2', { sfx: 'scream', gesture: 'scream', style: 'shout', speak: false, noYarn: true }));
+          beats.push(this._b(this._say('bored.s5_post', B.s5_post), 'embarrassed', { delay: 1500, gesture: 'shrug' }));
+        }
+    }
+    return this._reply(beats, 'bored_' + stage, { stage: stage });
+  };
+
+  /* ---------------- the mute button ---------------- */
+  Brain.prototype.onMute = function () {
+    this._begin();
+    var s = this.session, now = this._now(), M = lines().mute, mode = this.cfg.muteDrama;
+    s.muted = true; s.lastInteraction = now; s.boredStage = 0;
+    this.state.counters.mutes++;
+    var recent = now - s.muteShownAt < 10 * 60 * 1000;
+    if (mode === 'off') return this._reply([this._b(this._say('mute.off', M.off), 'sad', { silent: true })], 'mute');
+    if (mode === 'short' || recent || s.muteShows >= 2) {
+      return this._reply([
+        this._b(this._say('mute.short', M.short), 'sad', { silent: true, gesture: 'sit' }),
+        this._b(M.sniff, 'sob', { action: true, silent: true, delay: 1200 })
+      ], 'mute');
+    }
+    s.muteShownAt = now; s.muteShows++;
+    this._curseMax = 2;
+    var beats = [
+      this._b(this._say('mute.confused', M.confused), 'confused', { silent: true, gesture: 'point_mouth' }),
+      this._b(M.action1, 'confused', { action: true, silent: true, delay: 1700 }),
+      this._b(M.mouth, 'surprised', { silent: true, mouth: true, delay: 1500 }),
+      this._b(M.bargain, 'begging', { silent: true, delay: 2000 }),
+      this._b(M.beg, 'sad', { silent: true, delay: 2600, gesture: 'shake' }),
+      this._b(this._say('mute.curse_button', M.curse_button), 'angry', { silent: true, delay: 2600, gesture: 'shake' }),
+      this._b(M.po, 'begging', { silent: true, delay: 2600 }),
+      this._b(M.typed, 'sob', { silent: true, delay: 2600 }),
+      this._b(M.sniff, 'sob', { action: true, silent: true, delay: 1800 }),
+      this._b(M.sniff2, 'sob', { silent: true, delay: 1500 }),
+      this._b(M.growth, 'shy', { silent: true, delay: 2800, gesture: 'nod' })
+    ];
+    return this._reply(beats, 'mute');
+  };
+
+  Brain.prototype.onUnmute = function () {
+    this._begin();
+    var s = this.session, U2 = lines().unmute;
+    s.muted = false; s.lastInteraction = this._now(); s.boredStage = 0;
+    var j = P.pick(this, 'joke.any', L.Data.jokes, { raw: true });
+    var beats = [
+      this._b(U2.permission, 'shy', { style: 'whisper' }),
+      this._b(U2.thanks, 'proud', { style: 'whisper', delay: 1700, noYarn: true }),
+      this._b(U2.quote, 'cool', { delay: 1600, gesture: 'nod' }),
+      this._b(j.t, 'wink', { delay: 1800, gesture: 'bounce' }),
+      this._b(U2.sorry, 'shy', { delay: 1500 }),
+      this._b(U2.shout, 'excited', { delay: 1800, style: 'shout', gesture: 'scream', noYarn: true }),
+      this._b(U2.catch, 'embarrassed', { delay: 1400, gesture: 'shrug' })
+    ];
+    return this._reply(beats, 'unmute');
+  };
+
+  /* the fail-safe: "Leon, I need silence for real" */
+  Brain.prototype.requestQuiet = function () {
+    this._begin();
+    var s = this.session, Q = lines().quiet;
+    s.quiet = true; s.pending = null; s.boredStage = 0; s.lastInteraction = this._now();
+    var beats = [
+      this._b(P.fmt(this, Q.sob), 'sob', { sfx: 'sniffle', style: 'sob', gesture: 'sit' }),
+      this._b(Q.stay, 'tired', { silent: true, delay: 1700 })
+    ];
+    return this._reply(beats, 'quiet');
+  };
+
+  Leon_exports();
+  function Leon_exports() { Brain.DEFAULTS = DEFAULTS; Brain.BOREDOM = BOREDOM; L.Brain = Brain; L.defaults = DEFAULTS; }
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/avatar/parts.js ===== */
+/* Leon Offline — parts.js
+ * Pure drawing functions: every piece of Leon as an SVG string (no DOM needed, so tests and the sheet
+ * renderer can use them in Node). Coordinates live in a 400 x 460 box. Face centre is (200, 215). */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  var A = L.Avatar = L.Avatar || {};
+
+  var C = A.colors = {
+    navy: '#1c2760', mint: '#46dca9', mintDark: '#27bd8d', mintLight: '#9bf5d6', cream: '#fdf0b8', creamDark: '#f1d98d',
+    cheek: '#ff8fa8', eye: '#1b1346', iris: '#6c50e3', mouthIn: '#e8546f', tongue: '#ff97ab', white: '#ffffff',
+    heart: '#ff5c86', heartDark: '#e03a66', gold: '#ffd84a', goldDark: '#e8a91c', blue: '#4aa8ff', blueDark: '#2d6fd6',
+    red: '#ff3d4a', shadow: '#2a6f5a'
+  };
+  var SW = 5; /* main outline width */
+
+  function f(n) { return Math.round(n * 100) / 100; }
+  function attrs(o) { var s = ''; for (var k in o) if (o[k] !== undefined && o[k] !== null) s += ' ' + k + '="' + o[k] + '"'; return s; }
+  function path(d, fill, stroke, sw, extra) { return '<path d="' + d + '" fill="' + (fill || 'none') + '"' + (stroke ? ' stroke="' + stroke + '" stroke-width="' + (sw || SW) + '" stroke-linecap="round" stroke-linejoin="round"' : '') + attrs(extra) + '/>'; }
+  function circ(cx, cy, r, fill, stroke, sw, extra) { return '<circle cx="' + f(cx) + '" cy="' + f(cy) + '" r="' + f(r) + '" fill="' + (fill || 'none') + '"' + (stroke ? ' stroke="' + stroke + '" stroke-width="' + (sw || SW) + '"' : '') + attrs(extra) + '/>'; }
+  function ell(cx, cy, rx, ry, fill, stroke, sw, extra) { return '<ellipse cx="' + f(cx) + '" cy="' + f(cy) + '" rx="' + f(rx) + '" ry="' + f(ry) + '" fill="' + (fill || 'none') + '"' + (stroke ? ' stroke="' + stroke + '" stroke-width="' + (sw || SW) + '"' : '') + attrs(extra) + '/>'; }
+  function g(inner, tf, extra) { return '<g' + (tf ? ' transform="' + tf + '"' : '') + attrs(extra) + '>' + inner + '</g>'; }
+  function line(x1, y1, x2, y2, stroke, sw, extra) { return '<line x1="' + f(x1) + '" y1="' + f(y1) + '" x2="' + f(x2) + '" y2="' + f(y2) + '" stroke="' + stroke + '" stroke-width="' + sw + '" stroke-linecap="round"' + attrs(extra) + '/>'; }
+  A._s = { f: f, path: path, circ: circ, ell: ell, g: g, line: line, attrs: attrs };
+
+  /* ---------- small shapes ---------- */
+  function heartPath(s) { /* heart centred at 0,0 roughly 2s wide */
+    return 'M 0 ' + f(s * 0.9) + ' C ' + f(-s * 1.7) + ' ' + f(-s * 0.2) + ' ' + f(-s * 0.9) + ' ' + f(-s * 1.35) + ' 0 ' + f(-s * 0.55) + ' C ' + f(s * 0.9) + ' ' + f(-s * 1.35) + ' ' + f(s * 1.7) + ' ' + f(-s * 0.2) + ' 0 ' + f(s * 0.9) + ' Z';
+  }
+  function heart(x, y, s, rot, fill, op) {
+    return g(path(heartPath(s), fill || C.heart, C.navy, Math.max(2, s * 0.16)) + path('M ' + f(-s * 0.7) + ' ' + f(-s * 0.55) + ' Q ' + f(-s * 0.9) + ' ' + f(-s * 0.2) + ' ' + f(-s * 0.55) + ' ' + f(s * 0.05), 'none', 'rgba(255,255,255,.85)', Math.max(1.5, s * 0.14)),
+      'translate(' + f(x) + ',' + f(y) + ') rotate(' + (rot || 0) + ')', op ? { opacity: op } : null);
+  }
+  function starPath(r, ri, n) {
+    var d = '';
+    for (var i = 0; i < n * 2; i++) { var a = -Math.PI / 2 + i * Math.PI / n, rr = i % 2 ? ri : r; d += (i ? 'L' : 'M') + f(Math.cos(a) * rr) + ' ' + f(Math.sin(a) * rr) + ' '; }
+    return d + 'Z';
+  }
+  function sparkle(x, y, s, fill) { /* 4-point twinkle */
+    return g(path('M 0 ' + f(-s) + ' Q ' + f(s * 0.18) + ' ' + f(-s * 0.18) + ' ' + f(s) + ' 0 Q ' + f(s * 0.18) + ' ' + f(s * 0.18) + ' 0 ' + f(s) + ' Q ' + f(-s * 0.18) + ' ' + f(s * 0.18) + ' ' + f(-s) + ' 0 Q ' + f(-s * 0.18) + ' ' + f(-s * 0.18) + ' 0 ' + f(-s) + ' Z', fill || C.gold, '#e8a91c', 1.5), 'translate(' + f(x) + ',' + f(y) + ')');
+  }
+  function star(x, y, s, rot, fill) { return g(path(starPath(s, s * 0.45, 5), fill || C.gold, C.navy, Math.max(2, s * 0.14)), 'translate(' + f(x) + ',' + f(y) + ') rotate(' + (rot || 0) + ')'); }
+  A._s.heart = heart; A._s.star = star; A._s.sparkle = sparkle;
+
+  /* ---------- spikes (cream, outlined) generated around an ellipse ---------- */
+  function spikesOnEllipse(cx, cy, rx, ry, angles, size, halfW) {
+    var out = '';
+    angles.forEach(function (aDeg, i) {
+      var a = aDeg * Math.PI / 180, px = cx + rx * Math.cos(a), py = cy + ry * Math.sin(a);
+      var nx = Math.cos(a) / rx, ny = Math.sin(a) / ry, nl = Math.sqrt(nx * nx + ny * ny); nx /= nl; ny /= nl;
+      var tx = -ny, ty = nx, sz = size * (1 - i * 0.04);
+      var bx1 = px + tx * halfW - nx * 8, by1 = py + ty * halfW - ny * 8, bx2 = px - tx * halfW - nx * 8, by2 = py - ty * halfW - ny * 8;
+      var tipx = px + nx * sz, tipy = py + ny * sz;
+      out += path('M ' + f(bx1) + ' ' + f(by1) + ' Q ' + f((bx1 + tipx) / 2 + tx * 2) + ' ' + f((by1 + tipy) / 2 + ty * 2) + ' ' + f(tipx) + ' ' + f(tipy) + ' Q ' + f((bx2 + tipx) / 2 - tx * 2) + ' ' + f((by2 + tipy) / 2 - ty * 2) + ' ' + f(bx2) + ' ' + f(by2) + ' Z', C.cream, C.navy, 4.5);
+    });
+    return out;
+  }
+
+  /* ---------- head, body, tail, feet ---------- */
+  var HEAD = 'M 78 208 C 72 128, 132 78, 202 78 C 280 78, 330 132, 322 208 C 318 264, 268 298, 200 298 C 132 298, 84 264, 78 208 Z';
+  A.HEAD_PATH = HEAD;
+
+  A.drawHead = function () {
+    var sp = spikesOnEllipse(200, 190, 122, 110, [-84, -60, -36, -12, 12], 30, 15);
+    return sp + path(HEAD, C.mint, C.navy, SW + 0.5) +
+      path('M 92 232 C 110 282, 160 292, 200 292', 'none', C.mintDark, 6, { opacity: 0.55 }) +
+      ell(138, 122, 36, 13, 'rgba(255,255,255,.5)', null, 0, { transform: 'rotate(-28 138 122)' }) +
+      ell(176, 100, 9, 4, 'rgba(255,255,255,.55)', null, 0, { transform: 'rotate(-12 176 100)' });
+  };
+
+  A.drawTail = function () {
+    var spikes = [[300, 318, 12], [326, 322, 12], [350, 330, 11]].map(function (p) {
+      return path('M ' + (p[0] - p[2]) + ' ' + (p[1] + 4) + ' L ' + (p[0] + 2) + ' ' + (p[1] - 26) + ' L ' + (p[0] + p[2]) + ' ' + (p[1] + 2) + ' Z', C.cream, C.navy, 4);
+    }).join('');
+    return spikes +
+      path('M 258 368 C 300 372, 346 362, 384 322 C 380 360, 340 404, 262 404 Z', C.mint, C.navy, SW) +
+      path('M 276 396 C 322 392, 352 376, 372 346 C 368 372, 330 400, 276 402 Z', C.cream, null, 0, { opacity: 0.95 });
+  };
+
+  A.drawBody = function () {
+    return path('M 132 292 C 112 350, 138 412, 200 412 C 262 412, 288 350, 268 292 Z', C.mint, C.navy, SW) +
+      path('M 262 322 C 276 354, 262 398, 226 408', 'none', C.mintDark, 8, { opacity: 0.45 }) +
+      ell(200, 352, 50, 54, C.cream, null, 0) +
+      path('M 168 322 Q 200 336 232 322', 'none', C.creamDark, 3, { opacity: 0.6 }) +
+      path('M 166 352 Q 200 366 234 352', 'none', C.creamDark, 3, { opacity: 0.5 }) +
+      path('M 172 382 Q 200 394 228 382', 'none', C.creamDark, 3, { opacity: 0.5 });
+  };
+
+  A.drawFoot = function (cx) {
+    return ell(cx, 414, 33, 20, C.mint, C.navy, SW) + line(cx - 10, 400, cx - 10, 410, C.navy, 3) + line(cx + 2, 399, cx + 2, 410, C.navy, 3) + line(cx + 14, 400, cx + 14, 410, C.navy, 3) +
+      ell(cx - 12, 421, 5, 3.4, C.cream, null, 0) + ell(cx + 1, 423, 5, 3.4, C.cream, null, 0) + ell(cx + 14, 421, 5, 3.4, C.cream, null, 0);
+  };
+  A.drawFeet = function () { return A.drawFoot(152) + A.drawFoot(248); };
+
+  A.drawShadow = function (sx) {
+    return ell(200, 438, 118 * (sx || 1), 15 * (sx || 1), C.shadow, null, 0, { opacity: 0.22 });
+  };
+
+  /* ---------- arms: a thick curved capsule from shoulder to hand ---------- */
+  A.SHOULDER = { L: [140, 308], R: [260, 308] };
+  /* spec: {h:[x,y] hand, e:[x,y] elbow control, mitt:'fist'|'open'|'point'|'thumb'|'none', r:hand radius} */
+  A.drawArm = function (side, spec) {
+    var s = A.SHOULDER[side], h = spec.h, e = spec.e || [(s[0] + h[0]) / 2, (s[1] + h[1]) / 2 + 12];
+    var d = 'M ' + s[0] + ' ' + s[1] + ' Q ' + f(e[0]) + ' ' + f(e[1]) + ' ' + f(h[0]) + ' ' + f(h[1]);
+    var r = spec.r || 17, out = path(d, 'none', C.navy, 40) + path(d, 'none', C.mint, 30) + path(d, 'none', C.mintLight, 6, { opacity: 0.35, transform: 'translate(-3,-3)' });
+    var mitt = spec.mitt || 'open';
+    if (mitt !== 'none') {
+      out += circ(h[0], h[1], r, C.mint, C.navy, 4.5);
+      if (mitt === 'open') out += line(h[0] - 5, h[1] + r * 0.2, h[0] - 5, h[1] + r * 0.75, C.navy, 2.5) + line(h[0] + 5, h[1] + r * 0.2, h[0] + 5, h[1] + r * 0.75, C.navy, 2.5);
+      if (mitt === 'fist') out += path('M ' + f(h[0] - 8) + ' ' + f(h[1] - 3) + ' Q ' + f(h[0]) + ' ' + f(h[1] + 5) + ' ' + f(h[0] + 8) + ' ' + f(h[1] - 3), 'none', C.navy, 2.5);
+      if (mitt === 'point') out += path('M ' + f(h[0] - 7) + ' ' + f(h[1] - 8) + ' L ' + f(h[0] - 4) + ' ' + f(h[1] - 36) + ' Q ' + f(h[0] + 6) + ' ' + f(h[1] - 40) + ' ' + f(h[0] + 8) + ' ' + f(h[1] - 28) + ' L ' + f(h[0] + 8) + ' ' + f(h[1] - 6) + ' Z', C.mint, C.navy, 4.5);
+      if (mitt === 'thumb') out += path('M ' + f(h[0] - 11) + ' ' + f(h[1] - 8) + ' L ' + f(h[0] - 12) + ' ' + f(h[1] - 36) + ' Q ' + f(h[0] + 2) + ' ' + f(h[1] - 44) + ' ' + f(h[0] + 6) + ' ' + f(h[1] - 28) + ' L ' + f(h[0] + 6) + ' ' + f(h[1] - 6) + ' Z', C.mint, C.navy, 4.5);
+    }
+    return out;
+  };
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/avatar/face.js ===== */
+/* Leon Offline — face.js
+ * Eyes, brows, cheeks and mouths as SVG strings. The mouth is drawn separately from the rest of the
+ * face so lip-sync can swap it many times per second without redrawing anything else. */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  var A = L.Avatar = L.Avatar || {};
+  var C = A.colors, S = A._s, f = S.f, path = S.path, circ = S.circ, ell = S.ell, line = S.line, g = S.g;
+
+  var EL = [152, 208], ER = [248, 208];
+  A.EYES = { L: EL, R: ER };
+  A.MOUTH_AT = [200, 256];
+
+  /* ---------------- eyes ---------------- */
+  function eyeBase(cx, cy, o) {
+    o = o || {};
+    var s = o.s || 1, bl = o.blink || 0, lx = (o.look && o.look[0]) || 0, ly = (o.look && o.look[1]) || 0;
+    var rx = 15 * s, ry = 19 * s * (1 - bl * 0.9);
+    var x = cx + lx, y = cy + ly + (19 * s - ry) * 0.2;
+    var out = ell(x, y, rx, ry, C.eye);
+    out += ell(x, y + ry * 0.36, rx * 0.78, ry * 0.52, C.iris, null, 0, { opacity: 0.8 });
+    if (bl < 0.6) {
+      out += circ(x - 5.2 * s, y - 7 * s * (1 - bl), 6.2 * s, C.white, null, 0);
+      out += circ(x + 5.5 * s, y + 8 * s * (1 - bl), 2.9 * s, C.white, null, 0, { opacity: 0.95 });
+      if (o.glossy) { out += circ(x + 7 * s, y - 8 * s, 2.6 * s, C.white, null, 0, { opacity: 0.9 }) + ell(x, y + ry * 0.78, rx * 0.6, 3.2 * s, '#a9dcff', null, 0, { opacity: 0.85 }); }
+    }
+    return out;
+  }
+  function closedArc(cx, cy, w) { w = w || 14; return path('M ' + f(cx - w) + ' ' + f(cy + 1) + ' Q ' + f(cx) + ' ' + f(cy + 10) + ' ' + f(cx + w) + ' ' + f(cy + 1), 'none', C.navy, 5); }
+  function happyArc(cx, cy) { return path('M ' + f(cx - 15) + ' ' + f(cy + 7) + ' Q ' + f(cx) + ' ' + f(cy - 13) + ' ' + f(cx + 15) + ' ' + f(cy + 7), 'none', C.navy, 5.5); }
+  function chevron(cx, cy, side) { /* > for the left eye, < for the right */
+    var d = side < 0 ? 'M ' + f(cx - 12) + ' ' + f(cy - 10) + ' L ' + f(cx + 11) + ' ' + f(cy + 1) + ' L ' + f(cx - 12) + ' ' + f(cy + 12)
+      : 'M ' + f(cx + 12) + ' ' + f(cy - 10) + ' L ' + f(cx - 11) + ' ' + f(cy + 1) + ' L ' + f(cx + 12) + ' ' + f(cy + 12);
+    return path(d, 'none', C.navy, 5.5);
+  }
+  function lid(cx, cy, side, kind) {
+    /* mint "eyelid" polygon that cuts the top of the eye. kind: angry (inner end low) | sad (inner end high) | half (flat) */
+    var inner = side < 0 ? 1 : -1;               /* +1 means the inner end is on the right */
+    var xo = cx - inner * 22, xi = cx + inner * 22, yo, yi;
+    if (kind === 'angry') { yo = cy - 17; yi = cy + 1; }
+    else if (kind === 'sad') { yo = cy + 1; yi = cy - 17; }
+    else { yo = cy - 1; yi = cy - 1; }
+    var d = 'M ' + f(xo) + ' ' + f(cy - 30) + ' L ' + f(xi) + ' ' + f(cy - 30) + ' L ' + f(xi) + ' ' + f(yi) + ' L ' + f(xo) + ' ' + f(yo) + ' Z';
+    return path(d, C.mint, null, 0) + line(xo, yo, xi, yi, C.navy, 5);
+  }
+  A.eyePair = function (type, o) {
+    o = o || {};
+    var l = EL, r = ER, bl = o.blink || 0, look = o.look;
+    function both(fn) { return fn(l[0], l[1], -1) + fn(r[0], r[1], 1); }
+    if (bl >= 0.8 && /^(open|wide|angry|sad|glossy|half|think|big|small)/.test(type)) return both(function (x, y) { return closedArc(x, y); });
+    switch (type) {
+      case 'open': return both(function (x, y) { return eyeBase(x, y, { blink: bl, look: look }); });
+      case 'wide': return both(function (x, y) { return eyeBase(x, y, { s: 1.22, blink: bl, look: look, glossy: true }); });
+      case 'glossy': case 'big': return both(function (x, y) { return eyeBase(x, y, { s: 1.28, blink: bl, look: look, glossy: true }) + sparkleDots(x, y); });
+      case 'angry': return both(function (x, y, sd) { return eyeBase(x, y, { look: look }) + lid(x, y, sd, 'angry'); });
+      case 'sad': return both(function (x, y, sd) { return eyeBase(x, y, { glossy: true, s: 1.1, look: look }) + lid(x, y, sd, 'sad'); });
+      case 'half': return both(function (x, y, sd) { return eyeBase(x, y, { look: look || [0, 3] }) + lid(x, y, sd, 'half'); });
+      case 'think': return both(function (x, y) { return eyeBase(x, y, { look: look || [-5, -5], blink: bl }); });
+      case 'happy': return both(function (x, y) { return happyArc(x, y); });
+      case 'laugh': return both(function (x, y, sd) { return chevron(x, y, sd); });
+      case 'closed': return both(function (x, y, sd) { return closedArc(x, y) + line(x + sd * 14, y + 2, x + sd * 19, y + 6, C.navy, 3.5); });
+      case 'flat': return both(function (x, y) { return path('M ' + f(x - 14) + ' ' + f(y + 2) + ' L ' + f(x + 14) + ' ' + f(y + 2), 'none', C.navy, 5); });
+      case 'squint': return both(function (x, y, sd) { return chevron(x, y, sd); });
+      case 'wink_l': return happyArc(l[0], l[1]) + eyeBase(r[0], r[1], { look: look });
+      case 'wink_r': return eyeBase(l[0], l[1], { look: look }) + happyArc(r[0], r[1]);
+      case 'scared': return both(function (x, y) { return circ(x, y, 18, C.white, C.navy, 4) + circ(x + (look ? look[0] : 0), y + (look ? look[1] : 0), 5.5, C.eye, null, 0) + circ(x - 1 + (look ? look[0] : 0), y - 2, 1.8, C.white, null, 0); });
+      case 'uneven': return eyeBase(l[0], l[1], { s: 1.18, look: look }) + eyeBase(r[0], r[1], { s: 0.88, look: look });
+      case 'shades': return '';       /* the sunglasses prop covers the eyes */
+      default: return both(function (x, y) { return eyeBase(x, y, { look: look, blink: bl }); });
+    }
+  };
+  function sparkleDots(x, y) { return circ(x - 9, y + 4, 2.2, C.white, null, 0, { opacity: 0.9 }) + circ(x + 8, y - 11, 1.8, C.white, null, 0, { opacity: 0.8 }); }
+
+  /* ---------------- brows ---------------- */
+  function brow(cx, cy, ang, len, curve) { len = len || 30; return g(path('M ' + f(cx - len / 2) + ' ' + f(cy) + ' Q ' + f(cx) + ' ' + f(cy - (curve || 0)) + ' ' + f(cx + len / 2) + ' ' + f(cy), 'none', C.navy, 5.5), 'rotate(' + ang + ' ' + f(cx) + ' ' + f(cy) + ')'); }
+  /* specs are [leftAngle, rightAngle, dy, leftDy?, rightDy?] */
+  A.brows = function (spec) {
+    if (!spec) return '';
+    var dy = spec[2] || 0;
+    return brow(EL[0] + 1, 176 + dy + (spec[3] || 0), spec[0], 30, spec[5] || 0) + brow(ER[0] - 1, 176 + dy + (spec[4] || 0), spec[1], 30, spec[5] || 0);
+  };
+
+  /* ---------------- cheeks ---------------- */
+  A.cheeks = function (level, lines) {
+    var k = Math.max(0.55, Math.min(1.25, 0.55 + level * 0.5)), op = Math.min(0.96, 0.62 + level * 0.3);
+    var out = ell(116, 242, 27 * k, 18 * k, C.cheek, null, 0, { opacity: f(op) }) + ell(284, 242, 27 * k, 18 * k, C.cheek, null, 0, { opacity: f(op) });
+    out += ell(108, 236, 7 * k, 3.6 * k, 'rgba(255,255,255,.45)', null, 0, { transform: 'rotate(-20 108 236)' });
+    if (lines) { [-1, 1].forEach(function (sd) { var cx = sd < 0 ? 116 : 284; for (var i = -1; i <= 1; i++) out += line(cx + i * 9 - 3, 236, cx + i * 9 + 3, 250, '#e8567a', 2.6, { opacity: 0.8 }); }); }
+    return out;
+  };
+
+  /* ---------------- mouths (drawn around 0,0; caller translates to MOUTH_AT) ---------------- */
+  var N = C.navy;
+  function fang(x, y, s, flip) { return path('M ' + f(x - 3 * s) + ' ' + f(y) + ' L ' + f(x + 3 * s) + ' ' + f(y) + ' L ' + f(x) + ' ' + f(y + (flip ? -1 : 1) * 6 * s) + ' Z', C.white, N, 1.5); }
+  function openShape(rx, ry, top) {
+    /* a smile-shaped open mouth: flat-ish top lip, round bottom */
+    top = top === undefined ? -3 : top;
+    return 'M ' + f(-rx) + ' ' + f(top) + ' Q 0 ' + f(top + 9) + ' ' + f(rx) + ' ' + f(top) + ' Q ' + f(rx * 0.92) + ' ' + f(top + ry) + ' 0 ' + f(top + ry + 2) + ' Q ' + f(-rx * 0.92) + ' ' + f(top + ry) + ' ' + f(-rx) + ' ' + f(top) + ' Z';
+  }
+  function tongue(rx, ry, top) { top = top === undefined ? -3 : top; return ell(0, top + ry * 0.74, rx * 0.5, ry * 0.26, C.tongue, null, 0, { opacity: 0.95 }); }
+
+  var M = A.MOUTHS = {
+    smile_small: function () { return path('M -14 0 Q -7 9 0 2 Q 7 9 14 0', 'none', N, 4.5); },
+    smile: function () { return path('M -17 -2 Q 0 15 17 -2', 'none', N, 4.8); },
+    smile_open: function () { return path(openShape(14, 15), C.mouthIn, N, 4.5) + tongue(14, 15) + fang(-9, -2, 0.9) + fang(9, -2, 0.9); },
+    grin: function () { return path(openShape(21, 24), C.mouthIn, N, 4.8) + tongue(21, 24) + fang(-13, -2, 1.1) + fang(13, -2, 1.1); },
+    laugh: function () { return path(openShape(26, 31, -4), C.mouthIn, N, 4.8) + tongue(26, 31, -4) + fang(-16, -3, 1.2) + fang(16, -3, 1.2); },
+    yell: function () { return path('M -27 -8 Q 0 -17 27 -8 Q 24 28 0 31 Q -24 28 -27 -8 Z', C.mouthIn, N, 5) + ell(0, 21, 14, 7, C.tongue) + fang(-17, -9, 1.5) + fang(17, -9, 1.5) + fang(-6, -12, 1.1) + fang(6, -12, 1.1); },
+    scream: function () { return path('M -30 -10 Q 0 -20 30 -10 Q 28 34 0 36 Q -28 34 -30 -10 Z', C.mouthIn, N, 5) + ell(0, 26, 17, 8, C.tongue) + fang(-19, -11, 1.7) + fang(19, -11, 1.7); },
+    o_small: function () { return ell(0, 4, 8, 10, C.mouthIn, N, 4.5) + ell(0, 9, 4.5, 3.4, C.tongue); },
+    o_mid: function () { return ell(0, 6, 11, 14, C.mouthIn, N, 4.5) + ell(0, 13, 6, 4.4, C.tongue); },
+    frown: function () { return path('M -14 7 Q 0 -6 14 7', 'none', N, 4.8); },
+    wobble: function () { return path('M -15 6 Q -10 -2 -5 4 Q 0 -4 5 4 Q 10 -2 15 6', 'none', N, 4.5); },
+    cry: function () { return path('M -22 -2 Q 0 -12 22 -2 Q 20 28 0 30 Q -20 28 -22 -2 Z', C.mouthIn, N, 5) + ell(0, 21, 12, 6.5, C.tongue); },
+    pout: function () { return path('M -10 5 Q 0 -5 10 5', 'none', N, 4.8) + ell(0, 0, 3, 1.4, 'none'); },
+    kiss: function () { return ell(0, 3, 6, 7, C.mouthIn, N, 4) + path('M -5 3 Q 0 7 5 3', 'none', N, 2) ; },
+    flat: function () { return path('M -10 3 L 10 3', 'none', N, 5); },
+    smirk: function () { return path('M -14 4 Q 4 12 17 -3', 'none', N, 4.8) + path('M 17 -3 L 20 -7', 'none', N, 3); },
+    zigzag: function () { return path('M -17 3 L -11 -2 L -5 3 L 1 -2 L 7 3 L 13 -2 L 18 2', 'none', N, 4.2); },
+    tremble: function () { return path('M -13 2 Q -7 -4 -2 2 Q 3 8 8 2 Q 12 -2 15 3 Q 10 18 0 18 Q -10 17 -13 2 Z', C.mouthIn, N, 4.2); },
+    hmm: function () { return path('M -8 5 Q 3 1 14 -3', 'none', N, 4.8); },
+    tongue: function () { return path('M -16 -2 Q 0 13 16 -2', 'none', N, 4.8) + path('M -6 8 Q 0 24 8 9 Q 4 6 -6 8 Z', C.tongue, N, 3.5); },
+    drool: function () { return path(openShape(9, 12), C.mouthIn, N, 4.4) + ell(0, 7, 4.5, 3, C.tongue) + path('M 11 8 Q 15 18 11 24 Q 7 18 11 8 Z', '#bfe6ff', N, 2); },
+    ww: function () { return path('M -16 1 Q -8 10 0 1 Q 8 10 16 1', 'none', N, 4.5); },
+    nibble: function () { return path('M -9 6 L 9 6', 'none', N, 4.5) + circ(-3, 6, 1, N); }
+  };
+
+  /* lip-sync visemes. o = how open (0..1.4). The expression's own mouth is used for 'X'. */
+  A.VISEMES = ['X', 'M', 'A', 'E', 'I', 'O', 'U', 'F', 'L', 'S'];
+  A.viseme = function (v, o) {
+    o = Math.max(0.15, Math.min(1.45, o === undefined ? 1 : o));
+    switch (v) {
+      case 'M': return path('M -12 1 Q 0 ' + f(3 + o * 1.5) + ' 12 1', 'none', N, 4.8);
+      case 'A': return path('M ' + f(-13 * (0.8 + o * 0.2)) + ' -3 Q 0 ' + f(-7 - o * 2) + ' ' + f(13 * (0.8 + o * 0.2)) + ' -3 Q ' + f(12 * o) + ' ' + f(6 + 20 * o) + ' 0 ' + f(8 + 21 * o) + ' Q ' + f(-12 * o) + ' ' + f(6 + 20 * o) + ' ' + f(-13 * (0.8 + o * 0.2)) + ' -3 Z', C.mouthIn, N, 4.6) + ell(0, 5 + 18 * o, 8 * o, 4.6 * o, C.tongue, null, 0);
+      case 'E': return path('M -17 -2 Q 0 ' + f(-6 - o) + ' 17 -2 Q ' + f(15) + ' ' + f(3 + 9 * o) + ' 0 ' + f(4 + 10 * o) + ' Q -15 ' + f(3 + 9 * o) + ' -17 -2 Z', C.mouthIn, N, 4.6) + path('M -13 -2 Q 0 -5 13 -2 L 12 ' + f(2 + 2 * o) + ' Q 0 ' + f(1 + 2 * o) + ' -12 ' + f(2 + 2 * o) + ' Z', C.white, null, 0);
+      case 'I': return path('M -15 -1 Q 0 -5 15 -1 Q 13 ' + f(2 + 6 * o) + ' 0 ' + f(3 + 7 * o) + ' Q -13 ' + f(2 + 6 * o) + ' -15 -1 Z', C.mouthIn, N, 4.4) + path('M -11 -1 Q 0 -3 11 -1 L 10 ' + f(1.5 + o) + ' Q 0 ' + f(0.5 + o) + ' -10 ' + f(1.5 + o) + ' Z', C.white, null, 0);
+      case 'O': return ell(0, 4 + 3 * o, 9 + 2 * o, 5 + 11 * o, C.mouthIn, N, 4.5) + ell(0, 6 + 9 * o, 4.6, 2.8 + 2 * o, C.tongue, null, 0);
+      case 'U': return ell(0, 4 + 1.5 * o, 5.5 + 1.5 * o, 4 + 5 * o, C.mouthIn, N, 4.2);
+      case 'F': return path('M -13 0 Q 0 6 13 0', 'none', N, 4.6) + path('M -8 1 L 8 1 L 7 7 Q 0 9 -7 7 Z', C.white, N, 2.4);
+      case 'L': return path('M -12 -2 Q 0 -5 12 -2 Q 11 ' + f(3 + 8 * o) + ' 0 ' + f(4 + 9 * o) + ' Q -11 ' + f(3 + 8 * o) + ' -12 -2 Z', C.mouthIn, N, 4.4) + ell(0, 0 + 2 * o, 5, 3.4, C.tongue, null, 0);
+      case 'S': return path('M -15 -1 Q 0 3 15 -1 L 14 ' + f(3 + 3 * o) + ' Q 0 ' + f(7 + 3 * o) + ' -14 ' + f(3 + 3 * o) + ' Z', C.white, N, 4.2) + line(-7, 1, -7, 3 + 3 * o, N, 1.4) + line(0, 2, 0, 4 + 3 * o, N, 1.4) + line(7, 1, 7, 3 + 3 * o, N, 1.4);
+      default: return '';
+    }
+  };
+  A.mouth = function (name, o) { var fn = M[name] || M.smile_small; return g(fn(o), 'translate(' + A.MOUTH_AT[0] + ',' + A.MOUTH_AT[1] + ')'); };
+  A.visemeAt = function (v, o) { return g(A.viseme(v, o), 'translate(' + A.MOUTH_AT[0] + ',' + A.MOUTH_AT[1] + ')'); };
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/avatar/props.js ===== */
+/* Leon Offline — props.js
+ * Hats, glasses, held items and floating effects. Everything is a function returning SVG text. */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  var A = L.Avatar = L.Avatar || {};
+  var C = A.colors, S = A._s, f = S.f, path = S.path, circ = S.circ, ell = S.ell, line = S.line, g = S.g;
+  var heart = S.heart, star = S.star, sparkle = S.sparkle;
+
+  function glyphQ(x, y, s, col) {
+    return g(path('M -9 -12 Q -9 -25 2 -25 Q 13 -25 13 -13 Q 13 -4 3 0 Q 0 3 0 9', 'none', C.navy, 11 / 1) + path('M -9 -12 Q -9 -25 2 -25 Q 13 -25 13 -13 Q 13 -4 3 0 Q 0 3 0 9', 'none', col || C.blue, 6.5) + circ(0, 19, 5.6, col || C.blue, C.navy, 2.6), 'translate(' + f(x) + ',' + f(y) + ') scale(' + s + ')');
+  }
+  function glyphE(x, y, s, col, rot) {
+    return g(path('M 0 -26 L 0 4', 'none', C.navy, 12) + path('M 0 -26 L 0 4', 'none', col || C.gold, 7) + circ(0, 17, 6, col || C.gold, C.navy, 2.6), 'translate(' + f(x) + ',' + f(y) + ') rotate(' + (rot || 0) + ') scale(' + s + ')');
+  }
+  function glyphZ(x, y, s) { return g(path('M -9 -9 L 9 -9 L -9 9 L 9 9', 'none', C.navy, 9) + path('M -9 -9 L 9 -9 L -9 9 L 9 9', 'none', C.blue, 5), 'translate(' + f(x) + ',' + f(y) + ') scale(' + s + ')'); }
+  function puff(x, y, s) { return g(circ(-9, 4, 11, C.white, C.navy, 3.2) + circ(6, 0, 13, C.white, C.navy, 3.2) + circ(-1, 10, 10, C.white, C.navy, 3.2) + circ(9, 10, 8, C.white, null, 0) + circ(-5, 6, 9, C.white, null, 0), 'translate(' + f(x) + ',' + f(y) + ') scale(' + s + ')'); }
+  function drop(x, y, s, fill) { return g(path('M 0 -14 Q 10 2 0 10 Q -10 2 0 -14 Z', fill || '#9fd8ff', C.navy, 2.4) + path('M -3 -2 Q -5 3 -1 6', 'none', C.white, 2.2), 'translate(' + f(x) + ',' + f(y) + ') scale(' + s + ')'); }
+
+  /* ---------- head props (drawn inside the head group, so they tilt with the head) ---------- */
+  var HEAD_PROPS = {
+    nightcap: function () {
+      return path('M 262 116 Q 252 52 168 46 Q 118 44 92 60 Q 122 76 134 108 Z', '#5b8cff', C.navy, 5) +
+        star(210, 74, 7, -10, '#fff') + star(164, 66, 5.5, 12, '#fff') + star(130, 86, 4.5, -8, '#fff') +
+        path('M 270 110 Q 200 92 128 102 L 130 124 Q 200 114 268 132 Z', C.white, C.navy, 5) +
+        circ(90, 62, 13, C.white, C.navy, 4.5);
+    },
+    crown: function () {
+      return path('M 164 92 L 158 52 L 184 70 L 204 36 L 224 70 L 250 52 L 244 92 Z', C.gold, C.navy, 4.5) +
+        circ(158, 52, 5, '#ff6b8a', C.navy, 2) + circ(204, 36, 5.5, '#6bd0ff', C.navy, 2) + circ(250, 52, 5, '#ff6b8a', C.navy, 2) +
+        path('M 170 84 L 238 84', 'none', C.goldDark, 3);
+    },
+    shades: function () {
+      var lensL = 'M 120 194 Q 120 188 128 188 L 176 188 Q 186 188 186 198 Q 186 226 166 228 L 138 228 Q 120 226 120 206 Z';
+      var lensR = 'M 280 194 Q 280 188 272 188 L 224 188 Q 214 188 214 198 Q 214 226 234 228 L 262 228 Q 280 226 280 206 Z';
+      return path(lensL, '#141a3d', C.navy, 4.5) + path(lensR, '#141a3d', C.navy, 4.5) + path('M 186 198 Q 200 192 214 198', 'none', C.navy, 5) +
+        path('M 120 198 L 92 190', 'none', C.navy, 5) + path('M 280 198 L 308 190', 'none', C.navy, 5) +
+        path('M 130 196 L 150 196 L 136 214 L 130 214 Z', 'rgba(255,255,255,.35)') + path('M 226 196 L 246 196 L 232 214 L 226 214 Z', 'rgba(255,255,255,.35)') +
+        sparkle(300, 168, 9, '#fff');
+    },
+    glasses: function () {
+      return circ(152, 208, 29, 'rgba(210,240,255,.22)', C.navy, 4.5) + circ(248, 208, 29, 'rgba(210,240,255,.22)', C.navy, 4.5) +
+        path('M 181 206 Q 200 196 219 206', 'none', C.navy, 4.5) + path('M 123 204 L 96 198', 'none', C.navy, 4.5) + path('M 277 204 L 304 198', 'none', C.navy, 4.5) +
+        path('M 134 192 Q 142 184 152 184', 'none', 'rgba(255,255,255,.8)', 3) + path('M 230 192 Q 238 184 248 184', 'none', 'rgba(255,255,255,.8)', 3);
+    },
+    bandage: function () {
+      return g(path('M 214 98 L 262 98 Q 270 98 270 106 L 270 112 Q 270 120 262 120 L 214 120 Q 206 120 206 112 L 206 106 Q 206 98 214 98 Z', '#ffd9b0', C.navy, 3.6) +
+        path('M 228 98 L 228 120 M 248 98 L 248 120', 'none', '#e8b685', 2) + circ(238, 109, 3, '#e8b685', null, 0), 'rotate(-18 238 109)');
+    },
+    anger: function () {
+      var col = C.red, d = function (a) { return g(path('M -10 -2 Q -3 -2 -3 -10 M 10 -2 Q 3 -2 3 -10 M -10 2 Q -3 2 -3 10 M 10 2 Q 3 2 3 10', 'none', col, 4.4), 'rotate(' + a + ')'); };
+      return g(d(0), 'translate(268,124)');
+    }
+  };
+
+  /* ---------- things Leon holds, in front of the belly / near the mouth ---------- */
+  var BODY_PROPS = {
+    heart_big: function () { return heart(200, 346, 46, 0, C.heart); },
+    pillow: function () {
+      return g(path('M 112 340 Q 112 326 126 326 L 252 330 Q 270 332 268 350 L 262 392 Q 260 408 244 408 L 128 404 Q 112 402 114 388 Z', '#fbfdff', C.navy, 5) +
+        path('M 128 344 Q 150 352 190 346', 'none', '#dfe9f7', 3) + path('M 132 376 Q 160 386 200 380', 'none', '#dfe9f7', 3), 'rotate(-6 190 366)');
+    }
+  };
+  var MID_PROPS = {
+    burger: function () {
+      return g(path('M -36 -4 Q -36 -30 0 -30 Q 36 -30 36 -4 Z', '#e8a64f', C.navy, 4) + ell(-12, -20, 3.2, 1.8, '#fff3c4') + ell(6, -24, 3.2, 1.8, '#fff3c4') + ell(18, -16, 3.2, 1.8, '#fff3c4') +
+        path('M -38 -3 Q -30 4 -22 -3 Q -14 4 -6 -3 Q 2 4 10 -3 Q 18 4 26 -3 Q 32 2 38 -3 L 38 2 L -38 2 Z', '#79d65f', C.navy, 3) +
+        path('M -34 2 L 34 2 L 30 8 L -30 8 Z', '#ffd24a', C.navy, 3) +
+        path('M -35 8 Q -35 20 -24 20 L 24 20 Q 35 20 35 8 Z', '#7a4a2b', C.navy, 3.6) +
+        path('M -35 22 L 35 22 Q 35 36 18 36 L -18 36 Q -35 36 -35 22 Z', '#e8a64f', C.navy, 4), 'translate(236,262) rotate(-14) scale(0.95)');
+    },
+    star_wand: function () {
+      return line(300, 352, 322, 246, C.creamDark, 9) + line(300, 352, 322, 246, C.navy, 3.5, { opacity: 0.5 }) + star(326, 226, 26, 12, C.gold) + sparkle(356, 196, 9) + sparkle(296, 214, 7);
+    }
+  };
+
+  /* ---------- floating effects ---------- */
+  var FX = {
+    excl: function () { return [[96, 92, 74, 62], [118, 78, 110, 46], [66, 124, 40, 118]].map(function (l) { return line(l[0], l[1], l[2], l[3], C.navy, 10) + line(l[0], l[1], l[2], l[3], C.gold, 5.5); }).join(''); },
+    excl_q: function () { return glyphE(84, 92, 0.8, '#ff5c86', -14) + glyphQ(116, 70, 0.62, C.gold); },
+    sparkles: function () { return sparkle(66, 120, 11) + sparkle(338, 104, 13) + sparkle(84, 300, 8) + sparkle(344, 270, 9) + sparkle(300, 52, 7); },
+    hearts: function () { return heart(66, 126, 10, -16) + heart(336, 96, 13, 14) + heart(88, 66, 7, -8) + heart(320, 168, 8, 16) + heart(54, 210, 7, -10, C.cheek); },
+    hearts_small: function () { return heart(328, 108, 10, 14) + heart(80, 100, 8, -12); },
+    kiss_heart: function () { return heart(290, 232, 11, 14) + heart(320, 206, 7, 20, C.cheek); },
+    zzz: function () { return glyphZ(312, 98, 0.9) + glyphZ(344, 66, 1.2) + glyphZ(374, 30, 1.5); },
+    tears: function () {
+      function st(x, dir) { return path('M ' + (x - 6) + ' 224 C ' + (x - 8 + dir * 3) + ' 246 ' + (x - 8 + dir * 4) + ' 262 ' + (x - 5 + dir * 5) + ' 278 Q ' + (x + dir * 5) + ' 286 ' + (x + 6 + dir * 5) + ' 278 C ' + (x + 8 + dir * 4) + ' 262 ' + (x + 8 + dir * 3) + ' 246 ' + (x + 6) + ' 224 Z', '#b9e3ff', C.navy, 3) + path('M ' + (x - 2) + ' 232 Q ' + (x - 3 + dir * 2) + ' 252 ' + (x - 1 + dir * 4) + ' 270', 'none', C.white, 2.6, { opacity: 0.95 }); }
+      return st(140, -1) + st(260, 1) + drop(124, 296, 0.8) + drop(278, 300, 0.8);
+    },
+    tears_one: function () { return path('M 262 222 Q 255 244 251 272 Q 260 276 267 268 Q 268 244 272 224 Z', '#aedcff', C.navy, 3) + drop(256, 288, 0.8); },
+    tears_joy: function () { return drop(120, 196, 0.8, '#aedcff') + drop(282, 196, 0.8, '#aedcff'); },
+    tears_big: function () {
+      function st(x, dir) { return path('M ' + (x - 8) + ' 224 C ' + (x - 12 + dir * 4) + ' 250 ' + (x - 12 + dir * 8) + ' 280 ' + (x - 8 + dir * 10) + ' 302 Q ' + (x + dir * 10) + ' 314 ' + (x + 9 + dir * 10) + ' 302 C ' + (x + 12 + dir * 8) + ' 280 ' + (x + 12 + dir * 4) + ' 250 ' + (x + 8) + ' 224 Z', '#b9e3ff', C.navy, 3.2) + path('M ' + (x - 3) + ' 234 Q ' + (x - 4 + dir * 4) + ' 262 ' + (x + dir * 8) + ' 290', 'none', C.white, 3, { opacity: 0.95 }); }
+      return st(138, -1) + st(262, 1) + drop(110, 326, 0.9) + drop(292, 332, 0.9) + drop(98, 280, 0.7) + drop(304, 288, 0.7);
+    },
+    sweat: function () { return drop(310, 128, 1.1); },
+    question: function () { return glyphQ(318, 96, 0.95) + glyphQ(84, 70, 0.7, C.blueDark); },
+    shiver: function () { return [60, 340].map(function (x, i) { var s = i ? -1 : 1; return path('M ' + x + ' 140 q ' + (-9 * s) + ' 12 0 24 q ' + (9 * s) + ' 12 0 24 q ' + (-9 * s) + ' 12 0 24', 'none', C.blue, 4.5) + path('M ' + (x + 14 * s) + ' 150 q ' + (-8 * s) + ' 10 0 20 q ' + (8 * s) + ' 10 0 20', 'none', C.blue, 3.4, { opacity: 0.7 }); }).join(''); },
+    puff: function () { return puff(52, 130, 1) + puff(352, 126, 0.9); },
+    puff_small: function () { return puff(70, 150, 0.7); },
+    sigh: function () { return puff(300, 270, 0.8); },
+    broken_heart: function () { return g(path('M 0 13 C -22 -3 -14 -18 0 -9 L 4 -3 L -3 4 L 4 10 L 0 13 Z', C.red, C.navy, 2.6) + path('M 4 -3 L -3 4 L 4 10', 'none', C.white, 2) + path('M 0 -9 C 14 -18 22 -3 0 13', C.red, C.navy, 2.6), 'translate(92,98) scale(1.35) rotate(-10)'); },
+    swirl: function () { return path('M 66 96 q 14 -14 28 -2 q 12 14 -4 24 q -16 8 -24 -6 q -4 -14 10 -16', 'none', C.blueDark, 4); },
+    anger_two: function () { return g(FX.anger_mark(), 'translate(0,0)'); },
+    anger_mark: function () { return ''; },
+    bubble_bye: function () {
+      return path('M 296 52 Q 296 38 312 38 L 366 38 Q 384 38 384 54 L 384 74 Q 384 90 366 90 L 330 90 L 312 108 L 314 90 Q 296 90 296 74 Z', C.white, C.navy, 4.5) +
+        '<text x="340" y="73" text-anchor="middle" font-family="Trebuchet MS, Verdana, DejaVu Sans, sans-serif" font-weight="800" font-size="25" fill="' + C.navy + '">Bye!</text>';
+    },
+    star_burst: function () { return star(70, 112, 11, 12) + star(336, 100, 9, -10); }
+  };
+
+  A.HEAD_PROPS = HEAD_PROPS; A.BODY_PROPS = BODY_PROPS; A.MID_PROPS = MID_PROPS; A.FX = FX;
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/avatar/expressions.js ===== */
+/* Leon Offline — expressions.js
+ * The 25 expressions from the character sheet (+ neutral, sob, nerd) as plain data.
+ * Each one picks: eyes, brows, mouth, cheek blush, arm pose, head props, held props, floating effects.
+ * To invent a new expression, add an entry here, no drawing code needed. */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  var A = L.Avatar = L.Avatar || {};
+
+  /* arm poses: hand position (h), elbow bend (e), hand shape (mitt). front:true = drawn over the face. */
+  A.POSES = {
+    down:      { L: { h: [120, 368], e: [108, 336] }, R: { h: [280, 368], e: [292, 336] } },
+    belly:     { L: { h: [168, 356], e: [124, 352] }, R: { h: [232, 356], e: [276, 352] } },
+    cheer_one: { L: { h: [120, 368], e: [108, 336] }, R: { h: [346, 198], e: [348, 280] }, front: true },
+    up_both:   { L: { h: [54, 188], e: [52, 276] }, R: { h: [346, 188], e: [348, 276] }, front: true },
+    wave:      { L: { h: [120, 368], e: [108, 336] }, R: { h: [350, 204], e: [352, 286] }, front: true },
+    cheeks:    { L: { h: [112, 248], e: [96, 298] }, R: { h: [288, 248], e: [304, 298] }, front: true },
+    cheeks_low:{ L: { h: [148, 284], e: [112, 308] }, R: { h: [252, 284], e: [288, 308] }, front: true },
+    cover:     { L: { h: [164, 246], e: [102, 302] }, R: { h: [236, 246], e: [298, 302] }, front: true },
+    cross:     { L: { h: [238, 338], e: [168, 332] }, R: { h: [162, 346], e: [236, 352] } },
+    chin:      { L: { h: [170, 356], e: [126, 352] }, R: { h: [228, 286], e: [294, 322], }, front: true },
+    heart:     { L: { h: [152, 362], e: [118, 346] }, R: { h: [248, 362], e: [282, 346] } },
+    fists_up:  { L: { h: [92, 252], e: [70, 306], mitt: 'fist' }, R: { h: [308, 252], e: [330, 306], mitt: 'fist' }, front: true },
+    clasp:     { L: { h: [187, 302], e: [128, 334] }, R: { h: [213, 302], e: [272, 334] }, front: true },
+    eat:       { L: { h: [120, 368], e: [108, 336] }, R: { h: [262, 290], e: [304, 336] }, front: true },
+    star:      { L: { h: [120, 368], e: [108, 336] }, R: { h: [306, 296], e: [300, 340] } },
+    pillow:    { L: { h: [146, 366], e: [114, 350] }, R: { h: [254, 366], e: [286, 350] }, front: true },
+    thumbs:    { L: { h: [70, 300], e: [70, 350], mitt: 'thumb' }, R: { h: [280, 368], e: [292, 336] }, front: true },
+    kiss_hand: { L: { h: [120, 368], e: [108, 336] }, R: { h: [246, 286], e: [296, 324] }, front: true },
+    shrug:     { L: { h: [78, 308], e: [94, 360] }, R: { h: [322, 308], e: [306, 360] } },
+    point_mouth:{ L: { h: [120, 368], e: [108, 336] }, R: { h: [230, 280], e: [294, 322], mitt: 'point' }, front: true },
+    hold_head: { L: { h: [120, 368], e: [108, 336] }, R: { h: [296, 150], e: [344, 238] }, front: true },
+    index_up:  { L: { h: [120, 368], e: [108, 336] }, R: { h: [330, 250], e: [336, 312], mitt: 'point' }, front: true },
+    slump:     { L: { h: [112, 396], e: [100, 360] }, R: { h: [288, 396], e: [300, 360] } }
+  };
+
+  /* head: tilt in degrees, dy = body squash offset.  fxBack are drawn behind the character. */
+  var E = A.EXPRESSIONS = {
+    neutral:    { eyes: 'open',   brows: null,              mouth: 'smile_small', cheeks: 0.6, arms: 'down' },
+    happy:      { eyes: 'happy',  brows: null,              mouth: 'grin',        cheeks: 1,   arms: 'cheer_one', fx: ['excl'], tilt: -3 },
+    laughing:   { eyes: 'laugh',  brows: null,              mouth: 'laugh',       cheeks: 1,   arms: 'belly', fx: ['tears_joy', 'sparkles'], tilt: -9 },
+    angry:      { eyes: 'angry',  brows: [16, -16, 0],      mouth: 'yell',        cheeks: 0.45, arms: 'cross', headProps: ['anger'], fx: ['puff'] },
+    sad:        { eyes: 'sad',    brows: [-14, 14, 2],      mouth: 'wobble',      cheeks: 0.6, arms: 'cheeks_low', fx: ['tears', 'broken_heart'], tilt: 3 },
+    excited:    { eyes: 'laugh',  brows: null,              mouth: 'grin',        cheeks: 1,   arms: 'up_both', fx: ['excl', 'sparkles'] },
+    shy:        { eyes: 'half',   brows: [-6, 6, 4],        mouth: 'ww',          cheeks: 1.25, arms: 'belly', fx: ['hearts_small'], tilt: 5 },
+    surprised:  { eyes: 'wide',   brows: [-8, 8, -8],       mouth: 'o_small',     cheeks: 0.8, arms: 'cheeks', fx: ['excl_q'] },
+    sleepy:     { eyes: 'closed', brows: null,              mouth: 'nibble',      cheeks: 0.6, arms: 'pillow', headProps: ['nightcap'], bodyProps: ['pillow'], fx: ['zzz'], tilt: 9 },
+    thinking:   { eyes: 'think',  brows: [0, -14, -2, 0, -4], mouth: 'hmm',       cheeks: 0.7, arms: 'chin', fx: ['question'], tilt: -4 },
+    pouty:      { eyes: 'half',   brows: [12, -12, 0],      mouth: 'pout',        cheeks: 1.1, arms: 'cross', fx: ['puff_small'], tilt: 2 },
+    love:       { eyes: 'happy',  brows: null,              mouth: 'smile_open',  cheeks: 1.15, arms: 'heart', bodyProps: ['heart_big'], fx: ['hearts'] },
+    kiss:       { eyes: 'wink_r', brows: null,              mouth: 'kiss',        cheeks: 1,   arms: 'kiss_hand', fx: ['kiss_heart', 'hearts_small'], tilt: -4 },
+    wink:       { eyes: 'wink_r', brows: null,              mouth: 'smile_open',  cheeks: 0.95, arms: 'thumbs', fx: ['sparkles'], tilt: 3 },
+    embarrassed:{ eyes: 'half',   brows: [-10, 10, 3],      mouth: 'zigzag',      cheeks: 1.3, cheekLines: true, arms: 'cover', fx: ['sweat'], tilt: 4 },
+    proud:      { eyes: 'happy',  brows: null,              mouth: 'smirk',       cheeks: 0.9, arms: 'cross', headProps: ['crown'], fx: ['sparkles'], tilt: -2 },
+    scared:     { eyes: 'scared', brows: [-12, 12, -4],     mouth: 'tremble',     cheeks: 0.7, arms: 'cheeks', fx: ['shiver', 'sweat'] },
+    tired:      { eyes: 'flat',   brows: [-8, 8, 6],        mouth: 'flat',        cheeks: 0.55, arms: 'slump', fx: ['sigh'], tilt: 6, dy: 14, squash: 0.92 },
+    hurt:       { eyes: 'sad',    brows: [-14, 14, 2],      mouth: 'tremble',     cheeks: 0.7, arms: 'hold_head', headProps: ['bandage'], fx: ['tears_one', 'question'], tilt: -5 },
+    cool:       { eyes: 'shades', brows: null,              mouth: 'smirk',       cheeks: 0.6, arms: 'belly', headProps: ['shades'], fx: ['sparkles'], tilt: -3 },
+    angry2:     { eyes: 'squint', brows: [18, -18, -2],     mouth: 'scream',      cheeks: 0.4, arms: 'fists_up', headProps: ['anger'], fx: ['puff'], shake: true },
+    cheerful:   { eyes: 'happy',  brows: null,              mouth: 'smile_open',  cheeks: 1,   arms: 'star', midProps: ['star_wand'], fx: ['sparkles'], tilt: 3 },
+    hungry:     { eyes: 'wide',   brows: [-4, 4, -2],       mouth: 'drool',       cheeks: 0.9, arms: 'eat', midProps: ['burger'], look: [4, 6] },
+    confused:   { eyes: 'uneven', brows: [0, -18, -3, 0, -6], mouth: 'zigzag',    cheeks: 0.7, arms: 'cheeks_low', fx: ['question', 'swirl'], tilt: 5 },
+    begging:    { eyes: 'big',    brows: [-14, 14, 0],      mouth: 'wobble',      cheeks: 0.95, arms: 'clasp', fx: ['sparkles'] },
+    goodbye:    { eyes: 'happy',  brows: null,              mouth: 'grin',        cheeks: 1,   arms: 'wave', fx: ['bubble_bye', 'hearts_small'], tilt: -3 },
+    sob:        { eyes: 'squint', brows: [-16, 16, 2],      mouth: 'cry',         cheeks: 0.8, arms: 'cheeks_low', fx: ['tears_big'], tilt: 2 },
+    nerd:       { eyes: 'open',   brows: [0, -8, -2, 0, -3], mouth: 'smile_open',  cheeks: 0.8, arms: 'index_up', headProps: ['glasses'], fx: ['sparkles'], look: [3, -2], tilt: -3 }
+  };
+
+  /* the 25 on the sheet, in order */
+  A.SHEET = ['happy', 'laughing', 'angry', 'sad', 'excited', 'shy', 'surprised', 'sleepy', 'thinking', 'pouty', 'love', 'kiss', 'wink',
+    'embarrassed', 'proud', 'scared', 'tired', 'hurt', 'cool', 'angry2', 'cheerful', 'hungry', 'confused', 'begging', 'goodbye'];
+  A.NAMES = A.SHEET.concat(['neutral', 'sob', 'nerd']);
+
+  /* tolerant lookup: "Angry 2", "angry_2" -> angry2 */
+  A.resolveExpr = function (name) {
+    var n = String(name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (E[n]) return n;
+    if (n === 'angrytwo') return 'angry2';
+    return 'neutral';
+  };
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/avatar/avatar.js ===== */
+/* Leon Offline — avatar.js
+ * Assembles Leon from parts. A.layers(state) returns each layer as an SVG string (the animator updates
+ * only the layers that changed); A.render(state) returns one complete SVG document (used by the
+ * contact-sheet tool, tests, and the static fallback).
+ *   state: { expr, viseme, open, blink, look:[dx,dy], tilt, pose } */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  var A = L.Avatar = L.Avatar || {};
+  var S = A._s, g = S.g;
+
+  A.VIEW = { w: 400, h: 460 };
+  A.NECK = [200, 296];
+
+  A.layers = function (st) {
+    st = st || {};
+    var name = A.resolveExpr(st.expr), ex = A.EXPRESSIONS[name];
+    var look = st.look || ex.look, pose = A.POSES[st.pose || ex.arms] || A.POSES.down;
+    var mouth = st.viseme && st.viseme !== 'X' ? A.visemeAt(st.viseme, st.open === undefined ? 1 : st.open) : A.mouth(ex.mouth);
+    function arm(side) { return A.drawArm(side, pose[side]); }
+    var lay = {
+      name: name,
+      shadow: A.drawShadow(1),
+      fxBack: '',
+      tail: A.drawTail(),
+      body: A.drawBody(),
+      feetL: A.drawFoot(152), feetR: A.drawFoot(248),
+      bodyProps: (ex.bodyProps || []).map(function (n) { return A.BODY_PROPS[n](); }).join(''),
+      armsBack: { L: pose.front ? '' : arm('L'), R: pose.front ? '' : arm('R') },
+      head: A.drawHead(),
+      cheeks: A.cheeks(ex.cheeks, ex.cheekLines),
+      eyes: A.eyePair(ex.eyes, { blink: st.blink || 0, look: look }),
+      brows: A.brows(ex.brows),
+      mouth: mouth,
+      headProps: (ex.headProps || []).map(function (n) { return A.HEAD_PROPS[n](); }).join(''),
+      midProps: (ex.midProps || []).map(function (n) { return A.MID_PROPS[n](); }).join(''),
+      armsFront: { L: pose.front ? arm('L') : '', R: pose.front ? arm('R') : '' },
+      fx: (ex.fx || []).map(function (n) { return g(A.FX[n](), null, { 'class': 'fx fx-' + n }); }).join(''),
+      tilt: st.tilt !== undefined ? st.tilt : (ex.tilt || 0),
+      dy: ex.dy || 0, squash: ex.squash || 1, shake: !!ex.shake
+    };
+    return lay;
+  };
+
+  A.render = function (st, o) {
+    o = o || {};
+    var y = A.layers(st), tilt = y.tilt;
+    var body = y.shadow + y.fxBack + g(y.tail, null, { id: 'tail' }) + g(y.body + y.feetL + y.feetR + y.bodyProps, 'translate(0,' + y.dy + ')', { id: 'body' }) +
+      g(y.armsBack.L + y.armsBack.R, 'translate(0,' + y.dy + ')') +
+      g(y.head + y.cheeks + g(y.eyes, null, { id: 'eyes' }) + y.brows + g(y.mouth, null, { id: 'mouth' }) + y.headProps, 'translate(0,' + y.dy + ') rotate(' + tilt + ' ' + A.NECK[0] + ' ' + A.NECK[1] + ')', { id: 'head' }) +
+      g(y.midProps, 'translate(0,' + y.dy + ')') + g(y.armsFront.L + y.armsFront.R, 'translate(0,' + y.dy + ')') + y.fx;
+    var w = o.width || A.VIEW.w, h = o.height || A.VIEW.h;
+    return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + A.VIEW.w + ' ' + A.VIEW.h + '" width="' + w + '" height="' + h + '">' +
+      (o.background ? '<rect width="100%" height="100%" fill="' + o.background + '"/>' : '') + g(body, null, { id: 'leon' }) + '</svg>';
+  };
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/avatar/motion.js ===== */
+/* Leon Offline — motion.js
+ * Pure math for movement: idle breathing / floating, and the gesture library.
+ * Nothing here touches the DOM, so the same motion drives the SVG puppet, the sprite mode and the tests.
+ * Every function returns offsets: dx, dy (px in the 400x460 box), rot (deg, about the feet), sx, sy (scale),
+ * flip (1 = normal, -1 = mirrored, in-between = turning), headRot, headDy, tail, armL, armR (deg), footL, footR (px). */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  var M = L.Motion = {};
+  var PI = Math.PI, sin = Math.sin, cos = Math.cos, abs = Math.abs;
+
+  function zero() { return { dx: 0, dy: 0, rot: 0, sx: 1, sy: 1, flip: 1, headRot: 0, headDy: 0, tail: 0, armL: 0, armR: 0, footL: 0, footR: 0 }; }
+  M.zero = zero;
+  M.add = function (a, b) {
+    return { dx: a.dx + b.dx, dy: a.dy + b.dy, rot: a.rot + b.rot, sx: a.sx * b.sx, sy: a.sy * b.sy, flip: a.flip * b.flip, headRot: a.headRot + b.headRot, headDy: a.headDy + b.headDy,
+      tail: a.tail + b.tail, armL: a.armL + b.armL, armR: a.armR + b.armR, footL: a.footL + b.footL, footR: a.footR + b.footR };
+  };
+  function mk(o) { var z = zero(); for (var k in o) z[k] = o[k]; return z; }
+  function env(u) { /* smooth in/out so gestures never pop */ var e = Math.min(1, u / 0.12, (1 - u) / 0.14); return e <= 0 ? 0 : (e >= 1 ? 1 : e * e * (3 - 2 * e)); }
+  function ease(u) { return u * u * (3 - 2 * u); }
+
+  /* floating on the home screen: slow bob, breathing squash, little tail wag */
+  M.idle = function (t, mood) {
+    var calm = mood === 'sleepy' ? 0.6 : 1;
+    return mk({
+      dy: sin(t * 1.7) * 4 * calm, sy: 1 + 0.014 * sin(t * 2.3), sx: 1 - 0.009 * sin(t * 2.3), rot: sin(t * 0.8) * 0.7,
+      headRot: sin(t * 1.1 + 1) * 1.3, headDy: sin(t * 2.3 + 0.6) * 0.8, tail: sin(t * 2.1) * 3.5
+    });
+  };
+
+  /* talking: the head and body ride the syllables a little. amp 0..1.5 */
+  M.talk = function (t, amp) {
+    if (!amp) return zero();
+    return mk({ headDy: sin(t * 15) * 1.6 * amp, headRot: sin(t * 7.3) * 1.8 * amp, dy: -abs(sin(t * 7.5)) * 2.2 * amp, sy: 1 + 0.012 * amp * sin(t * 15) });
+  };
+
+  /* a short "pop" when the expression changes. u 0..1 */
+  M.pop = function (u) {
+    if (u >= 1) return zero();
+    var k = sin(u * PI * 2.2) * (1 - u);
+    return mk({ sx: 1 - 0.05 * k, sy: 1 + 0.07 * k });
+  };
+
+  /* Gestures: dur (ms), pose (arm pose to hold during it, optional), mouth (force a mouth, optional), fn(u) -> offsets. u runs 0..1. */
+  var G = M.GESTURES = {
+    bounce:    { dur: 900, fn: function (u) { var a = abs(sin(u * PI * 2)); return mk({ dy: -30 * a, sy: 1 + 0.06 * a - 0.05 * (1 - a), sx: 1 - 0.04 * a + 0.04 * (1 - a), footL: -4 * a, footR: -4 * a }); } },
+    hop:       { dur: 600, fn: function (u) { var a = sin(u * PI); return mk({ dy: -44 * a, sy: 1 + 0.08 * a, sx: 1 - 0.05 * a, footL: -6 * a, footR: -6 * a, armL: -10 * a, armR: 10 * a }); } },
+    shake:     { dur: 700, fn: function (u) { var d = 1 - u * 0.4; return mk({ headRot: 10 * sin(u * PI * 7) * d, dx: 4 * sin(u * PI * 14) * d, rot: 2 * sin(u * PI * 7) }); } },
+    spin:      { dur: 1000, fn: function (u) { var a = sin(u * PI); return mk({ flip: cos(u * PI * 2), dy: -22 * a, sy: 1 + 0.04 * a }); } },
+    wave:      { dur: 1500, pose: 'wave', fn: function (u) { return mk({ armR: 16 * sin(u * PI * 6), headRot: 3 * sin(u * PI * 3), dy: -3 * abs(sin(u * PI * 3)) }); } },
+    legbounce: { dur: 1500, fn: function (u) { var a = sin(u * PI * 8); return mk({ dy: -2.5 * abs(a), footL: -7 * Math.max(0, a), footR: -7 * Math.max(0, -a), headRot: 1.5 * a, headDy: 1.2 * a }); } },
+    pace:      { dur: 2200, fn: function (u) { var x = sin(u * PI * 2), step = sin(u * PI * 10); return mk({ dx: 46 * x, dy: -4 * abs(step), rot: 3 * cos(u * PI * 2), footL: -6 * Math.max(0, step), footR: -6 * Math.max(0, -step), headRot: 2 * step }); } },
+    scream:    { dur: 1100, mouth: 'scream', fn: function (u) { var a = sin(u * PI); return mk({ sy: 1 + 0.1 * a, sx: 1 - 0.05 * a, dy: -8 * a, headRot: -8 * a, dx: 3 * sin(u * PI * 36) * a, headDy: -4 * a }); } },
+    wiggle:    { dur: 1000, fn: function (u) { return mk({ rot: 7 * sin(u * PI * 4), headRot: -3 * sin(u * PI * 4), tail: 12 * sin(u * PI * 8), dy: -2 * abs(sin(u * PI * 4)) }); } },
+    nod:       { dur: 700, fn: function (u) { var a = sin(u * PI * 2); return mk({ headRot: 5 * a, headDy: 7 * Math.max(0, a), sy: 1 - 0.01 * Math.max(0, a) }); } },
+    sit:       { dur: 1700, fn: function (u) { var a = sin(u * PI); return mk({ dy: 12 * a, sy: 1 - 0.06 * a, sx: 1 + 0.04 * a, headRot: 5 * a, headDy: 6 * a }); } },
+    shrug:     { dur: 1100, pose: 'shrug', fn: function (u) { var a = sin(u * PI); return mk({ dy: -4 * a, headRot: 7 * sin(u * PI * 2), sy: 1 - 0.02 * a }); } },
+    point_mouth: { dur: 1600, pose: 'point_mouth', fn: function (u) { return mk({ headRot: 5 * sin(u * PI), dx: 2 * sin(u * PI * 5) }); } }
+  };
+  M.gestureNames = Object.keys(G);
+
+  /* offsets for a gesture at elapsed ms (null when finished or unknown) */
+  M.gesture = function (name, elapsed, durOverride) {
+    var g = G[name]; if (!g) return null;
+    var dur = durOverride || g.dur;
+    if (elapsed >= dur) return null;
+    var u = Math.max(0, elapsed / dur), e = env(u), o = g.fn(u);
+    /* blend towards zero at the edges so the gesture eases in and out */
+    return { dx: o.dx * e, dy: o.dy * e, rot: o.rot * e, sx: 1 + (o.sx - 1) * e, sy: 1 + (o.sy - 1) * e, flip: 1 + (o.flip - 1) * (name === 'spin' ? 1 : e), headRot: o.headRot * e, headDy: o.headDy * e,
+      tail: o.tail * e, armL: o.armL * e, armR: o.armR * e, footL: o.footL * e, footR: o.footR * e };
+  };
+  M.duration = function (name) { return G[name] ? G[name].dur : 0; };
+  M.ease = ease;
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/avatar/animator.js ===== */
+/* Leon Offline — animator.js
+ * Brings the SVG puppet to life inside a DOM container:
+ *   var leon = Leon.Avatar.create(document.getElementById('leon'));
+ *   leon.setExpression('happy'); leon.gesture('wave'); leon.setMouth('A', 1);
+ * Idle floating, breathing, blinking and eye wandering run by themselves. Only the layers that changed
+ * are redrawn; per-frame work is a handful of transform attributes. */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  var A = L.Avatar = L.Avatar || {}, M = L.Motion;
+
+  var CSS = '.leon-svg{display:block;width:100%;height:100%;overflow:visible}.leon-svg .fx{transform-box:fill-box;transform-origin:center}' +
+    '.leon-svg .fx-zzz,.leon-svg .fx-hearts,.leon-svg .fx-hearts_small,.leon-svg .fx-kiss_heart,.leon-svg .fx-question,.leon-svg .fx-swirl{animation:lnfloat 2.2s ease-in-out infinite}' +
+    '.leon-svg .fx-sparkles,.leon-svg .fx-star_burst{animation:lntwinkle 1.5s ease-in-out infinite}' +
+    '.leon-svg .fx-excl,.leon-svg .fx-excl_q{animation:lnpulse .8s ease-in-out infinite}' +
+    '.leon-svg .fx-tears,.leon-svg .fx-tears_big,.leon-svg .fx-tears_one,.leon-svg .fx-tears_joy,.leon-svg .fx-sweat{animation:lndrip 1.7s ease-in infinite}' +
+    '.leon-svg .fx-shiver{animation:lnshiver .16s linear infinite}' +
+    '.leon-svg .fx-puff,.leon-svg .fx-puff_small,.leon-svg .fx-sigh{animation:lnpuff 1.7s ease-in-out infinite}' +
+    '@keyframes lnfloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-7px)}}' +
+    '@keyframes lntwinkle{0%,100%{opacity:.45;transform:scale(.85)}50%{opacity:1;transform:scale(1.12)}}' +
+    '@keyframes lnpulse{0%,100%{transform:scale(1)}50%{transform:scale(1.14)}}' +
+    '@keyframes lndrip{0%{transform:translateY(-3px);opacity:.75}70%{opacity:1}100%{transform:translateY(6px);opacity:.85}}' +
+    '@keyframes lnshiver{0%,100%{transform:translateX(-2px)}50%{transform:translateX(2px)}}' +
+    '@keyframes lnpuff{0%,100%{transform:scale(.92);opacity:.85}50%{transform:scale(1.1);opacity:1}}' +
+    '.leon-svg.calm *{animation:none!important}';
+
+  var PARTS = ['shadow', 'root', 'fxBack', 'tail', 'torso', 'feetL', 'feetR', 'bodyProps', 'armsBackL', 'armsBackR', 'head', 'headShape', 'cheeks', 'eyes', 'brows', 'mouth', 'headProps', 'midProps', 'armsFrontL', 'armsFrontR', 'fx'];
+  var BLINKABLE = /^(open|wide|angry|sad|glossy|half|think|big|uneven|small)$/;
+
+  function skeleton() {
+    function p(n, inner) { return '<g data-p="' + n + '">' + (inner || '') + '</g>'; }
+    return '<svg class="leon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="-10 -60 420 530" role="img" aria-label="Leon the dino"><style>' + CSS + '</style>' +
+      p('shadow') + '<g data-p="root">' + p('fxBack') + p('tail') + p('torso') + p('feetL') + p('feetR') + p('bodyProps') + p('armsBackL') + p('armsBackR') +
+      '<g data-p="head">' + p('headShape') + p('cheeks') + p('eyes') + p('brows') + p('mouth') + p('headProps') + '</g>' +
+      p('midProps') + p('armsFrontL') + p('armsFrontR') + p('fx') + '</g></svg>';
+  }
+
+  function rnd(a, b) { return a + Math.random() * (b - a); }
+  function r2(n) { return Math.round(n * 100) / 100; }
+
+  A.create = function (container, opts) {
+    opts = opts || {};
+    container.innerHTML = skeleton();
+    var svg = container.querySelector('svg'), P = {};
+    PARTS.forEach(function (n) { P[n] = container.querySelector('[data-p="' + n + '"]'); });
+    var reduce = false;
+    try { reduce = !!(root.matchMedia && root.matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (e) {}
+    if (reduce || opts.calm) svg.setAttribute('class', 'leon-svg calm');
+
+    var S = { expr: 'neutral', viseme: 'X', open: 1, blink: 0, look: null, pose: null, mouthForce: null, speaking: 0 };
+    var ex = A.EXPRESSIONS.neutral;
+    var cur = { tilt: 0, dy: 0, sy: 1 }, target = { tilt: 0, dy: 0, sy: 1 };
+    var now = 0, popAt = -10, gest = null, blinkAt = 2, blinkT0 = -1, lookAt = 3, saccade = [0, 0], running = false, raf = null, lastFrame = 0;
+    var frameMs = 1000 / (opts.fps || 30);
+
+    /* static layers: drawn once */
+    P.tail.innerHTML = A.drawTail(); P.torso.innerHTML = A.drawBody();
+    P.feetL.innerHTML = A.drawFoot(152); P.feetR.innerHTML = A.drawFoot(248); P.headShape.innerHTML = A.drawHead();
+    P.shadow.innerHTML = A.drawShadow(1);
+
+    function eyesMarkup() {
+      var look = ex.look || (saccade[0] || saccade[1] ? saccade : null);
+      return A.eyePair(ex.eyes, { blink: BLINKABLE.test(ex.eyes) ? S.blink : 0, look: look });
+    }
+    function drawEyes() { P.eyes.innerHTML = eyesMarkup(); }
+    function drawMouth() {
+      var v = S.mouthForce || S.viseme;
+      P.mouth.innerHTML = (v && v !== 'X') ? (A.MOUTHS[v] ? A.mouth(v) : A.visemeAt(v, S.open)) : A.mouth(ex.mouth);
+    }
+    function drawArms() {
+      var pose = A.POSES[S.pose || ex.arms] || A.POSES.down, front = !!pose.front;
+      P.armsBackL.innerHTML = front ? '' : A.drawArm('L', pose.L); P.armsBackR.innerHTML = front ? '' : A.drawArm('R', pose.R);
+      P.armsFrontL.innerHTML = front ? A.drawArm('L', pose.L) : ''; P.armsFrontR.innerHTML = front ? A.drawArm('R', pose.R) : '';
+    }
+    function drawExpression() {
+      P.cheeks.innerHTML = A.cheeks(ex.cheeks, ex.cheekLines);
+      P.brows.innerHTML = A.brows(ex.brows);
+      P.headProps.innerHTML = (ex.headProps || []).map(function (n) { return A.HEAD_PROPS[n](); }).join('');
+      P.bodyProps.innerHTML = (ex.bodyProps || []).map(function (n) { return A.BODY_PROPS[n](); }).join('');
+      P.midProps.innerHTML = (ex.midProps || []).map(function (n) { return A.MID_PROPS[n](); }).join('');
+      P.fx.innerHTML = (ex.fx || []).map(function (n) { return '<g class="fx fx-' + n + '">' + A.FX[n]() + '</g>'; }).join('');
+      drawArms(); drawEyes(); drawMouth();
+      target.tilt = ex.tilt || 0; target.dy = ex.dy || 0; target.sy = ex.squash || 1;
+    }
+
+    var ctl = {
+      el: svg, state: S,
+      setExpression: function (name, o) {
+        var n = A.resolveExpr(name);
+        if (n === S.expr && !(o && o.force)) return n;
+        S.expr = n; ex = A.EXPRESSIONS[n]; popAt = now; drawExpression();
+        return n;
+      },
+      getExpression: function () { return S.expr; },
+      /* v: one of A.VISEMES ('X' = back to the expression's own mouth), open: 0.15 .. 1.45 */
+      setMouth: function (v, open) {
+        open = open === undefined ? 1 : open;
+        if (v === S.viseme && Math.abs(open - S.open) < 0.08) return;
+        S.viseme = v || 'X'; S.open = open; drawMouth();
+      },
+      setSpeaking: function (amp) { S.speaking = amp || 0; },
+      setPose: function (name) { S.pose = name || null; drawArms(); },
+      gesture: function (name, o) {
+        o = o || {};
+        var def = M.GESTURES[name]; if (!def) return 0;
+        ctl._endGesture();
+        var dur = o.dur || def.dur;
+        gest = { name: name, t0: now, dur: dur, pose: def.pose || null, mouth: def.mouth || null };
+        if (gest.pose) { S.pose = gest.pose; drawArms(); }
+        if (gest.mouth) { S.mouthForce = gest.mouth; drawMouth(); }
+        return dur;
+      },
+      _endGesture: function () {
+        if (!gest) return;
+        var g0 = gest; gest = null;
+        if (g0.pose) { S.pose = null; drawArms(); }
+        if (g0.mouth) { S.mouthForce = null; drawMouth(); }
+      },
+      blink: function () { blinkT0 = now; },
+      lookAt: function (dx, dy) { saccade = [dx || 0, dy || 0]; drawEyes(); },
+      setCalm: function (on) { svg.setAttribute('class', on ? 'leon-svg calm' : 'leon-svg'); },
+
+      /* one animation frame at time t (seconds). start() calls this for you; tests can call it by hand. */
+      step: function (t) {
+        var dt = Math.min(0.1, Math.max(0.001, t - now)); now = t;
+        /* blink: 0 -> .5 -> 1 -> .5 -> 0 over ~220ms */
+        if (blinkT0 < 0 && now >= blinkAt) { blinkT0 = now; }
+        if (blinkT0 >= 0) {
+          var bt = (now - blinkT0) * 1000, bv = bt < 55 ? 0.5 : (bt < 115 ? 1 : (bt < 170 ? 0.5 : 0));
+          if (bt >= 220) { blinkT0 = -1; blinkAt = now + (Math.random() < 0.2 ? 0.35 : rnd(2.4, 5.6)); bv = 0; }
+          if (bv !== S.blink) { S.blink = bv; if (BLINKABLE.test(ex.eyes)) drawEyes(); }
+        }
+        /* eyes wander a little */
+        if (now >= lookAt) {
+          lookAt = now + rnd(1.6, 4.2);
+          if (!ex.look && !S.speaking) { var nl = Math.random() < 0.4 ? [0, 0] : [Math.round(rnd(-3, 3)), Math.round(rnd(-2, 2))]; if (nl[0] !== saccade[0] || nl[1] !== saccade[1]) { saccade = nl; if (BLINKABLE.test(ex.eyes)) drawEyes(); } }
+        }
+        /* ease towards the expression's posture */
+        var k = Math.min(1, dt * 9);
+        cur.tilt += (target.tilt - cur.tilt) * k; cur.dy += (target.dy - cur.dy) * k; cur.sy += (target.sy - cur.sy) * k;
+        var calm = svg.getAttribute('class') === 'leon-svg calm';
+        var m = calm ? M.zero() : M.idle(now, S.expr);
+        if (gest) { var go = M.gesture(gest.name, (now - gest.t0) * 1000, gest.dur); if (go) m = M.add(m, go); else ctl._endGesture(); }
+        if (S.speaking && !calm) m = M.add(m, M.talk(now, S.speaking));
+        if (!calm) m = M.add(m, M.pop((now - popAt) / 0.45));
+        var jitter = (ex.shake && !calm) ? Math.sin(now * 90) * 1.6 : 0;
+        var dx = m.dx + jitter, dy = m.dy + cur.dy;
+        var tf = 'translate(' + r2(dx) + ',' + r2(dy) + ') translate(200,430) rotate(' + r2(m.rot) + ') scale(' + r2(m.sx * m.flip * 1000) / 1000 + ',' + r2(m.sy * cur.sy * 1000) / 1000 + ') translate(-200,-430)';
+        P.root.setAttribute('transform', tf);
+        P.head.setAttribute('transform', 'translate(0,' + r2(m.headDy) + ') rotate(' + r2(m.headRot + cur.tilt) + ' 200 296)');
+        P.tail.setAttribute('transform', 'rotate(' + r2(m.tail) + ' 262 380)');
+        P.feetL.setAttribute('transform', 'translate(0,' + r2(m.footL) + ')'); P.feetR.setAttribute('transform', 'translate(0,' + r2(m.footR) + ')');
+        var aL = 'rotate(' + r2(m.armL) + ' 140 308)', aR = 'rotate(' + r2(m.armR) + ' 260 308)';
+        P.armsBackL.setAttribute('transform', aL); P.armsFrontL.setAttribute('transform', aL); P.armsBackR.setAttribute('transform', aR); P.armsFrontR.setAttribute('transform', aR);
+        var sh = Math.max(0.55, Math.min(1.2, 1 + (m.dy + cur.dy) / 120));
+        P.shadow.setAttribute('transform', 'translate(200,438) scale(' + r2(sh) + ',' + r2(sh) + ') translate(-200,-438)'); P.shadow.setAttribute('opacity', r2(Math.max(0.35, Math.min(1, 1 - (m.dy + cur.dy) / 160))));
+      },
+      start: function () {
+        if (running) return; running = true;
+        var tick = function (ms) {
+          if (!running) return;
+          if (ms - lastFrame >= frameMs - 1) { lastFrame = ms; ctl.step(ms / 1000); }
+          raf = root.requestAnimationFrame ? root.requestAnimationFrame(tick) : root.setTimeout(function () { tick(Date.now()); }, frameMs);
+        };
+        raf = root.requestAnimationFrame ? root.requestAnimationFrame(tick) : root.setTimeout(function () { tick(Date.now()); }, frameMs);
+        if (root.document && !ctl._vis) { ctl._vis = function () { if (root.document.hidden) { running = false; } else if (!running) ctl.start(); }; root.document.addEventListener('visibilitychange', ctl._vis); }
+      },
+      stop: function () { running = false; if (raf && root.cancelAnimationFrame) root.cancelAnimationFrame(raf); },
+      destroy: function () { ctl.stop(); if (ctl._vis && root.document) root.document.removeEventListener('visibilitychange', ctl._vis); container.innerHTML = ''; }
+    };
+    drawExpression();
+    ctl.step(0.016);
+    if (opts.expr) ctl.setExpression(opts.expr);
+    if (opts.autostart !== false) ctl.start();
+    return ctl;
+  };
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/voice/g2p.js ===== */
+/* Leon Offline — g2p.js
+ * Text -> phonemes for Leon's voice and lip-sync. Rule-based "Filipino orthography" (Tagalog spelling is almost
+ * phonetic) plus a small lexicon of English words, numbers and letters, so Taglish sounds like a Filipino speaker
+ * reading it. Phones: vowels a e i o u @(schwa) | consonants p b t d k g m n N(ng) f v s z S(sh) h tS dZ l r w y.
+ * A leading ' marks a stressed vowel in lexicon entries. No DOM, no network. */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  var G = L.G2P = {};
+
+  /* ---------------- lexicon (phones separated by spaces) ---------------- */
+  var LEX = {
+    /* Leon's own words */
+    yarn: "y 'a r n", leon: "l 'e o n", dino: "d 'a y n o", charot: "tS a r 'o t", hehe: "h 'e h e", huhu: "h 'u h u", hmm: "'@ m", hm: "'@ m", mm: "'@ m", ahh: "'a", ah: "'a", aaah: "'a", ay: "'a y", uy: "'u y", po: "p 'o", opo: "o p 'o",
+    science: "s 'a y @ n s", scientist: "s 'a y @ n t i s t", scientific: "s a y @ n t 'i f i k", scientifically: "s a y @ n t 'i f i k @ l i", math: "m 'a t", okay: "o k 'e y", ok: "o k 'e y",
+    joke: "dZ 'o w k", jokes: "dZ 'o w k s", fact: "f 'a k t", facts: "f 'a k t s", quote: "k w 'o w t", quotes: "k w 'o w t s", call: "k 'o l", sorry: "s 'o r i", earth: "'e r t", time: "t 'a y m",
+    data: "d 'e y t a", volume: "v 'o l y u m", estimate: "'e s t i m e y t", promise: "p r 'o m i s", offline: "'o f l a y n", online: "'o n l a y n", phone: "f 'o w n", level: "l 'e v @ l", number: "n 'a m b e r",
+    gravity: "g r 'a v i t i", name: "n 'e y m", mode: "m 'o w d", water: "w 'o t e r", curse: "k 'e r s", love: "l 'a v", derivative: "d e r 'i v a t i v", variable: "v 'e r i a b @ l", zero: "z 'i r o",
+    atmosphere: "'a t m o s f i r", electron: "i l 'e k t r o n", electrons: "i l 'e k t r o n s", atom: "'a t @ m", calculator: "k 'a l k y u l e y t e r", compute: "k @ m p y 'u t", engine: "'e n dZ i n",
+    universe: "y 'u n i v e r s", equation: "i k w 'e y S @ n", explanation: "e k s p l a n 'e y S @ n", feelings: "f 'i l i N s", crush: "k r 'a S", mute: "m 'y u t", unmute: "a n m 'y u t", silence: "s 'a y l @ n s",
+    sure: "S 'u r", please: "p l 'i z", thanks: "t 'a N k s", thank: "t 'a N k", hello: "h e l 'o w", hi: "h 'a y", hey: "h 'e y", bye: "b 'a y", good: "g 'u d", great: "g r 'e y t", nice: "n 'a y s", cute: "k y 'u t", cool: "k 'u l",
+    funny: "f 'a n i", fun: "f 'a n", free: "f r 'i", real: "r 'i @ l", really: "r 'i l i", very: "v 'e r i", just: "dZ 'a s t", yes: "y 'e s", no: "n 'o w", not: "n 'o t", now: "n 'a w", new: "n 'u", know: "n 'o w", knows: "n 'o w z",
+    /* function words */
+    the: "d @", a: "@", an: "a n", and: "a n d", of: "o v", to: "t u", too: "t 'u", you: "y u", your: "y o r", youre: "y u r", we: "w i", were: "w e r", i: "'a y", im: "a y m", ill: "a y l", ive: "a y v", id: "a y d",
+    is: "i z", it: "i t", its: "i t s", in: "i n", on: "o n", at: "a t", as: "a z", be: "b i", or: "o r", if: "i f", so: "s 'o w", do: "d u", does: "d 'a z", did: "d i d", dont: "d 'o w n t", cant: "k 'a n t", wont: "w 'o w n t", isnt: "'i z @ n t",
+    thats: "d a t s", whats: "w 'a t s", lets: "l 'e t s", heres: "h 'i r z", theres: "d 'e r z", can: "k a n", will: "w i l", with: "w i t", for: "f o r", from: "f r 'a m", by: "b 'a y", my: "m 'a y", me: "m 'i", he: "h 'i", she: "S 'i",
+    that: "d a t", this: "d i s", there: "d 'e r", they: "d 'e y", them: "d e m", then: "d 'e n", these: "d 'i z", those: "d 'o w z", than: "d a n", what: "w 'a t", when: "w 'e n", where: "w 'e r", which: "w 'i tS", who: "h 'u", why: "w 'a y", how: "h 'a w",
+    are: "'a r", am: "a m", have: "h a v", has: "h a z", had: "h a d", was: "w a z", been: "b i n", would: "w u d", could: "k u d", should: "S u d", one: "w 'a n", only: "'o w n l i", also: "'o l s o", more: "m 'o r", some: "s 'a m", any: "'e n i", all: "'o l",
+    out: "'a w t", up: "'a p", down: "d 'a w n", over: "'o w v e r", about: "@ b 'a w t", because: "b i k 'o z", but: "b 'a t", maybe: "m 'e y b i", again: "@ g 'e n", ready: "r 'e d i", home: "h 'o w m", here: "h 'i r", same: "s 'e y m",
+    /* words that show up in Leon's talk */
+    pone: "p 'o w n", warning: "w 'o r n i N", comfort: "k 'a m f e r t", charge: "tS 'a r dZ", charger: "tS 'a r dZ e r", reboot: "r i b 'u t", screen: "s k r 'i n", screenshot: "s k r 'i n S o t", scroll: "s k r 'o w l",
+    answer: "'a n s e r", solve: "s 'o l v", solution: "s o l 'u S @ n", slope: "s l 'o w p", graph: "g r 'a f", curve: "k 'e r v", formula: "f 'o r m y u l a", theory: "t 'i o r i", physics: "f 'i z i k s", chemistry: "k 'e m i s t r i",
+    energy: "'e n e r dZ i", light: "l 'a y t", sunlight: "s 'a n l a y t", sunflower: "s 'a n f l a w e r", green: "g r 'i n", purple: "p 'e r p @ l", blue: "b l 'u", red: "r 'e d", yellow: "y 'e l o w", orange: "'o r i n dZ", black: "b l 'a k", white: "w 'a y t",
+    average: "'a v e r i dZ", percent: "p e r s 'e n t", degrees: "d i g r 'i z", prime: "p r 'a y m", pi: "p 'a y", cube: "k y 'u b", area: "'e r i a", circle: "s 'e r k @ l", equal: "'i k w @ l", positive: "p 'o z i t i v", negative: "n 'e g a t i v",
+    minus: "m 'a y n @ s", plus: "p l 'a s", times: "t 'a y m z", divided: "d i v 'a y d e d", point: "p 'o y n t", equals: "'i k w @ l z", total: "t 'o w t @ l", split: "s p l 'i t", tip: "t 'i p", round: "r 'a w n d", half: "h 'a f",
+    boss: "b 'o s", bes: "b 'e s", sir: "s 'e r", maam: "m 'a m", kuya: "k 'u y a", dear: "d 'i r", friend: "f r 'e n d", friends: "f r 'e n d z", barkada: "b a r k 'a d a", filipino: "f i l i p 'i n o", pinoy: "p 'i n o y",
+    jeepney: "dZ 'i p n i", jeep: "dZ 'i p", traffic: "t r 'a f i k", coffee: "k 'o f i", kape: "k 'a p e", lunch: "l 'a n tS", dinner: "d 'i n e r", merienda: "m e r i 'e n d a", snack: "s n 'a k", rice: "r 'a y s", adobo: "a d 'o b o", sinigang: "s i n i g 'a N",
+    hour: "'a w e r", minute: "m 'i n i t", second: "s 'e k @ n d", morning: "m 'o r n i N", afternoon: "a f t e r n 'u n", evening: "'i v n i N", night: "n 'a y t", today: "t u d 'e y", tomorrow: "t u m 'o r o w", sleep: "s l 'i p",
+    imagination: "i m a dZ i n 'e y S @ n", experiment: "i k s p 'e r i m @ n t", hypothesis: "h a y p 'o t e s i s", reaction: "r i 'a k S @ n", pressure: "p r 'e S e r", vacuum: "v 'a k y u m", carbon: "k 'a r b @ n", fibonacci: "f i b o n 'a tS i",
+    probability: "p r o b a b 'i l i t i", entropy: "'e n t r o p i", integral: "'i n t e g r @ l", irrational: "i r 'a S @ n @ l", constant: "k 'o n s t @ n t", asymptote: "'a s i m p t o w t", deviation: "d i v i 'e y S @ n",
+    superposition: "s u p e r p o z 'i S @ n", catalyst: "k 'a t a l i s t", photosynthesis: "f o t o s 'i n t e s i s", electricity: "i l e k t r 'i s i t i", equator: "i k w 'e y t e r", vibration: "v a y b r 'e y S @ n",
+    /* numbers */
+    two: "t 'u", three: "t r 'i", four: "f 'o r", five: "f 'a y v", six: "s 'i k s", seven: "s 'e v @ n", eight: "'e y t", nine: "n 'a y n", ten: "t 'e n", eleven: "i l 'e v @ n", twelve: "t w 'e l v",
+    thirteen: "t e r t 'i n", fourteen: "f o r t 'i n", fifteen: "f i f t 'i n", sixteen: "s i k s t 'i n", seventeen: "s e v @ n t 'i n", eighteen: "e y t 'i n", nineteen: "n a y n t 'i n",
+    twenty: "t w 'e n t i", thirty: "t 'e r t i", forty: "f 'o r t i", fifty: "f 'i f t i", sixty: "s 'i k s t i", seventy: "s 'e v @ n t i", eighty: "'e y t i", ninety: "n 'a y n t i",
+    hundred: "h 'a n d r @ d", thousand: "t 'a w z @ n d", million: "m 'i l y @ n", billion: "b 'i l y @ n", oh: "'o w",
+    /* Filipino function words the rules would get wrong */
+    mga: "m a N 'a", ng: "n a N", sa: "s a", ang: "'a N", nang: "n 'a N", ngayon: "N 'a y o n"
+  };
+  /* spelled-out letters (for NCMH, PH, AI ...) */
+  var LETTERS = { a: "'e y", b: "b 'i", c: "s 'i", d: "d 'i", e: "'i", f: "'e f", g: "dZ 'i", h: "'e y tS", i: "'a y", j: "dZ 'e y", k: "k 'e y", l: "'e l", m: "'e m", n: "'e n", o: "'o w", p: "p 'i", q: "k y 'u", r: "'a r", s: "'e s", t: "t 'i", u: "y 'u", v: "v 'i", w: "d 'a b @ l y u", x: "'e k s", y: "w 'a y", z: "z 'i" };
+  var DIGITS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'];
+  var ONES = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen'];
+  var TENS = ['', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'];
+
+  function below1000(n) {
+    var w = [];
+    if (n >= 100) { w.push(ONES[Math.floor(n / 100)], 'hundred'); n %= 100; }
+    if (n >= 20) { w.push(TENS[Math.floor(n / 10)]); n %= 10; if (n) w.push(ONES[n]); }
+    else if (n > 0) w.push(ONES[n]);
+    return w;
+  }
+  /* integer (as a digit string) -> English number words */
+  G.numberWords = function (digits) {
+    digits = String(digits).replace(/^0+(?=\d)/, '');
+    if (digits.length > 12) return digits.split('').map(function (d) { return DIGITS[+d]; });
+    var n = parseInt(digits, 10);
+    if (n === 0) return ['zero'];
+    var w = [], parts = [[1e9, 'billion'], [1e6, 'million'], [1e3, 'thousand']];
+    parts.forEach(function (p) { if (n >= p[0]) { w = w.concat(below1000(Math.floor(n / p[0])), p[1]); n %= p[0]; } });
+    return w.concat(below1000(n));
+  };
+  function spellDigits(s) { return s.split('').filter(function (c) { return /\d/.test(c); }).map(function (d) { return DIGITS[+d]; }); }
+
+  /* ---------------- letter-to-sound rules (Filipino orthography + a few English patterns) ---------------- */
+  var VOW = { a: 1, e: 1, i: 1, o: 1, u: 1 };
+  function isV(c) { return !!VOW[c]; }
+  function rules(w) {
+    var out = [], i = 0, n = w.length;
+    while (i < n) {
+      var c = w[i], c2 = w[i + 1] || '', c3 = w[i + 2] || '', prev = w[i - 1] || '';
+      var two = c + c2;
+      if (w.substr(i, 4) === 'tion' && i > 0) { out.push('S', '@', 'n'); i += 4; continue; }
+      if (two === 'ng') { out.push('N'); i += 2; continue; }
+      if (two === 'ch') { out.push('tS'); i += 2; continue; }
+      if (two === 'sh') { out.push('S'); i += 2; continue; }
+      if (two === 'th') { out.push('t'); i += 2; continue; }
+      if (two === 'ph') { out.push('f'); i += 2; continue; }
+      if (two === 'ck') { out.push('k'); i += 2; continue; }
+      if (two === 'qu') { out.push('k', 'w'); i += 2; continue; }
+      if (two === 'gh') { i += 2; continue; }
+      if (two === 'wh') { out.push('w'); i += 2; continue; }
+      if (i === 0 && (two === 'kn' || two === 'wr')) { i += 1; continue; }
+      if (two === 'ee') { out.push('i'); i += 2; continue; }
+      if (two === 'oo') { out.push('u'); i += 2; continue; }
+      if (two === 'ou' && !isV(c3)) { out.push('a', 'w'); i += 2; continue; }
+      if (c === c2 && !isV(c) && c !== 'n') { i += 1; continue; }              /* double consonants */
+      if (c === 'y') { out.push(isV(c2) || (i === 0) ? 'y' : (isV(prev) ? 'y' : 'i')); i++; continue; }
+      if (c === 'w') { out.push('w'); i++; continue; }
+      if (c === 'c') { out.push(/[eiy]/.test(c2) ? 's' : 'k'); i++; continue; }
+      if (c === 'x') { out.push('k', 's'); i++; continue; }
+      if (c === 'q') { out.push('k'); i++; continue; }
+      if (c === 'j') { out.push('dZ'); i++; continue; }
+      if (c === 'ñ') { out.push('n', 'y'); i++; continue; }
+      if (c === 'z') { out.push('z'); i++; continue; }
+      if (/[abdefghiklmnoprstuv]/.test(c)) { out.push(c); i++; continue; }
+      i++;                                                                   /* anything else is skipped */
+    }
+    return out;
+  }
+  function stressify(tokens) {
+    var idx = [];
+    tokens.forEach(function (t, k) { if (/^'?[aeiou@]$/.test(t.p)) idx.push(k); });
+    var any = tokens.some(function (t) { return t.st; });
+    if (any || !idx.length) return;
+    var pick = idx.length >= 2 ? idx[idx.length - 2] : idx[0];
+    if (idx.length === 1 && tokens.length <= 2) return;                       /* tiny function-like words stay unstressed */
+    tokens[pick].st = 1;
+  }
+  function parseLex(s) {
+    return s.split(' ').filter(Boolean).map(function (p) { return p.charAt(0) === "'" ? { p: p.slice(1), st: 1 } : { p: p, st: 0 }; });
+  }
+  /* "aaaah", "hmmmm", "yessss": 3+ repeats collapse to one long sound (double vowels like "maaga" stay two syllables) */
+  G.word = function (w) {                                                    /* lowercase letters -> [{p, st, lng?}] */
+    var lenC = null, base = w.replace(/([a-zñ])\1{2,}/g, function (m, c) { if (!lenC) lenC = c; return c; });
+    if (lenC && /^[aeiou]$/.test(lenC) === false && lenC !== 'h' && base.length < 2) lenC = null;
+    var toks = LEX.hasOwnProperty(base) ? parseLex(LEX[base]) : (function () { var t = rules(base).map(function (p) { return { p: p, st: 0 }; }); stressify(t); return t; })();
+    if (lenC) {
+      var k = -1, i;
+      if (lenC === 'h') { for (i = toks.length - 1; i >= 0; i--) if (/^[aeiou@]$/.test(toks[i].p)) { k = i; break; } }
+      else for (i = 0; i < toks.length; i++) if (toks[i].p === lenC) { k = i; break; }
+      if (k >= 0) { toks[k].lng = 2.4; if (/^[aeiou@]$/.test(toks[k].p)) toks[k].st = 1; }
+    }
+    return toks;
+  };
+
+  /* ---------------- text -> token stream ---------------- */
+  var PAUSE = { ',': 170, ';': 230, ':': 210, '.': 330, '?': 360, '!': 310, '…': 430 };
+  var SYMBOLS = { '%': ['percent'], '&': ['and'], '+': ['plus'], '=': ['equals'], '\u00d7': ['times'], '\u00f7': ['divided', 'by'], '@': ['at'], '#': ['number'], '\u00b0': ['degrees'], '\u03c0': ['pi'] };
+  var RE = /([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ']*)|(\d+(?:[.,:]\d+)*)|(\.{2,}|…|[.,!?;:])|(\s+)|([^\sA-Za-z\d])/g;
+
+  /* returns {tokens:[{p, st, w, end?}], words:[{text, start, end, first, last}]}
+   * pauses are {p:'_', ms, w:-1}. token.end is '.', '?' or '!' on the last token before a sentence break. */
+  G.phonemize = function (text) {
+    var src = String(text || ''), tokens = [], words = [], m, lastTok = null, phoneRuns = [], pm;
+    var PHONE = /(?:\(\d{2,4}\)\s?)?\b\d{3,4}[ -]\d{3,4}(?:[ -]\d{3,4})?\b/g;     /* 0917 899 8727, (02) 8804 4673 */
+    while ((pm = PHONE.exec(src))) phoneRuns.push([pm.index, pm.index + pm[0].length]);
+    function inPhone(i) { return phoneRuns.some(function (r) { return i >= r[0] && i < r[1]; }); }
+    function pushWord(textWord, start, end, phones, caps) {
+      if (!phones.length) return;
+      var wi = words.length, first = tokens.length;
+      phones.forEach(function (ph) { var t = { p: ph.p, st: ph.st || 0, w: wi }; if (ph.lng) t.lng = ph.lng; if (caps) t.caps = 1; tokens.push(t); });
+      words.push({ text: textWord, start: start, end: end, first: first, last: tokens.length - 1, caps: !!caps });
+    }
+    function pushNumberWords(list, start, end, label) {
+      var ph = []; list.forEach(function (wd) { ph = ph.concat(G.word(wd)); });
+      pushWord(label, start, end, ph);
+    }
+    RE.lastIndex = 0;
+    while ((m = RE.exec(src))) {
+      var start = m.index, end = start + m[0].length;
+      if (m[1]) {
+        var raw = m[1], parts = raw.split("'").join('').toLowerCase();
+        if (/^[A-Z]{2,5}$/.test(raw) && !/[AEIOU]/.test(raw.replace(/^AI$/, 'B')) || /^(AI|PH|OK|TV|DM|GPS|USB)$/.test(raw) && raw !== 'OK') {
+          var ph = []; raw.toLowerCase().split('').forEach(function (ch) { ph = ph.concat(parseLex(LETTERS[ch] || '')); });
+          pushWord(raw, start, end, ph);
+        } else pushWord(raw, start, end, G.word(parts.replace(/[^a-zñ]/g, '')), raw.length >= 2 && raw === raw.toUpperCase() && /[A-Z]/.test(raw));
+      } else if (m[2]) {
+        var d = m[2];
+        if (/^\d{1,2}:\d{2}$/.test(d)) {                                       /* clock time */
+          var hm = d.split(':'), words2 = G.numberWords(hm[0]);
+          if (hm[1] !== '00') words2 = words2.concat(hm[1].charAt(0) === '0' ? ['oh', DIGITS[+hm[1].charAt(1)]] : G.numberWords(hm[1]));
+          pushNumberWords(words2, start, end, d);
+        } else {
+          var clean = d.replace(/,(?=\d{3}(?:\D|$))/g, '');
+          if (/^\d+\.\d+$/.test(clean)) {
+            var ip = clean.split('.');
+            pushNumberWords(G.numberWords(ip[0]).concat(['point'], spellDigits(ip[1])), start, end, d);
+          } else if (/^\d+$/.test(clean)) {
+            var bare = clean.length >= 4 && !/^(19|20)\d\d$/.test(clean) || clean === '911' || clean.charAt(0) === '0' || inPhone(start);
+            pushNumberWords(bare ? spellDigits(clean) : G.numberWords(clean), start, end, d);   /* phone numbers and hotlines are read digit by digit */
+          } else pushNumberWords(spellDigits(d), start, end, d);
+        }
+      } else if (m[3]) {
+        var ch = m[3].length > 1 ? '…' : m[3];
+        if (lastTok && lastTok.p !== '_') { if (ch === '.' || ch === '?' || ch === '!') lastTok.end = ch; else if (ch === '…') lastTok.end = '.'; else lastTok.phr = ch; }
+        if (tokens.length) tokens.push({ p: '_', ms: PAUSE[ch] || 200, w: -1, punct: ch });
+      } else if (m[5]) {
+        var sym = SYMBOLS[m[5]];
+        if (sym) pushNumberWords(sym, start, end, m[5]);
+      }
+      lastTok = tokens.length ? tokens[tokens.length - 1] : null;
+    }
+    /* do not end on a pause */
+    return { tokens: tokens, words: words, text: src };
+  };
+
+  G.LEXICON_SIZE = Object.keys(LEX).length;
+  G.PHONES = 'a e i o u @ p b t d k g m n N f v s z S h tS dZ l r w y'.split(' ');
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/voice/leonsynth.js ===== */
+/* Leon Offline — leonsynth.js
+ * LeonSynth: Leon's own voice, generated from scratch with no recordings, no network and no model files.
+ * It is a small Klatt-style formant synthesizer:
+ *   text -> Leon.G2P phones -> durations + pitch contour (prosody) -> formant / amplitude tracks -> samples.
+ *   voice source : glottal-flow-derivative pulse (polyBLEP band-limited) + tilt filter + aspiration noise
+ *   vocal tract  : cascade of 5 resonators (F1..F5), nasal pole + zero for m n ng
+ *   consonants   : band-pass noise (frication, stop bursts), closures, voice bars, locus-based formant transitions
+ * It sounds like a cute synthetic dino voice, not a human recording: best on Filipino spelling, English is approximate.
+ *
+ *   var r = Leon.LeonSynth.synth('Hello po, yarn!', { style: 'excited' });
+ *   r.pcm (Float32Array), r.sampleRate (22050), r.duration (s), r.timeline, r.words
+ *   var p = Leon.LeonSynth.plan(text, opts)   // same without rendering samples (used for silent lip movement)
+ *
+ * No DOM, no network. Works in Node, a browser, a WebView or a Worker. */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  var SR = 22050, TAU = Math.PI * 2;
+
+  function clamp(x, a, b) { return x < a ? a : (x > b ? b : x); }
+  function isVow(p) { return p === 'a' || p === 'e' || p === 'i' || p === 'o' || p === 'u' || p === '@'; }
+
+  /* ---------------- DSP blocks ---------------- */
+  function Res() { this.a = 1; this.b = 0; this.c = 0; this.y1 = 0; this.y2 = 0; }       /* 2-pole resonator, unity DC gain */
+  Res.prototype.set = function (f, bw) {
+    f = clamp(f, 40, SR * 0.46); bw = Math.max(bw, 20);
+    var r = Math.exp(-Math.PI * bw / SR);
+    this.c = -r * r; this.b = 2 * r * Math.cos(TAU * f / SR); this.a = 1 - this.b - this.c;
+  };
+  Res.prototype.run = function (x) { var y = this.a * x + this.b * this.y1 + this.c * this.y2; this.y2 = this.y1; this.y1 = y; return y; };
+
+  function Anti() { this.a = 1; this.b = 0; this.c = 0; this.x1 = 0; this.x2 = 0; }      /* anti-resonator (nasal zero), unity DC gain */
+  Anti.prototype.set = function (f, bw) {
+    f = clamp(f, 100, SR * 0.46); bw = Math.max(bw, 40);
+    var r = Math.exp(-Math.PI * bw / SR), c = -r * r, b = 2 * r * Math.cos(TAU * f / SR), a = 1 - b - c;
+    this.a = 1 / a; this.b = -b / a; this.c = -c / a;
+  };
+  Anti.prototype.run = function (x) { var y = this.a * x + this.b * this.x1 + this.c * this.x2; this.x2 = this.x1; this.x1 = x; return y; };
+
+  function BP() { this.g = 0; this.b = 0; this.c = 0; this.x1 = 0; this.x2 = 0; this.y1 = 0; this.y2 = 0; }  /* band-pass for noise */
+  BP.prototype.set = function (f, bw) {
+    f = clamp(f, 150, SR * 0.46); bw = Math.max(bw, 80);
+    var r = Math.exp(-Math.PI * bw / SR);
+    this.c = -r * r; this.b = 2 * r * Math.cos(TAU * f / SR); this.g = (1 - r * r) * 0.5;
+  };
+  BP.prototype.run = function (x) { var y = this.g * (x - this.x2) + this.b * this.y1 + this.c * this.y2; this.x2 = this.x1; this.x1 = x; this.y2 = this.y1; this.y1 = y; return y; };
+
+  function rngMake(seed) { var s = (seed | 0) || 123456789; return function () { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; return ((s >>> 0) / 4294967296) * 2 - 1; }; }
+  function blep(t, dt) {                                                                  /* polyBLEP residual for a step at t = 0 */
+    if (t < dt) { t /= dt; return t + t - t * t - 1; }
+    if (t > 1 - dt) { t = (t - 1) / dt; return t * t + t + t + 1; }
+    return 0;
+  }
+
+  /* ---------------- phone table ----------------
+   * F: formants of a bright adult-female voice (Hz); scaled by opts.formant. B: bandwidths. d: base duration (ms).
+   * k: V vowel, G glide/liquid, R tap, M nasal, F fricative, H h, P stop, A affricate. */
+  var PH = {
+    a:  { k: 'V', F: [790, 1350, 2650], B: [130, 130, 180], d: 95, amp: 1.00 },
+    e:  { k: 'V', F: [540, 1990, 2700], B: [120, 120, 180], d: 90, amp: 0.95 },
+    i:  { k: 'V', F: [330, 2350, 3050], B: [100, 120, 190], d: 80, amp: 0.85 },
+    o:  { k: 'V', F: [540, 1000, 2600], B: [120, 120, 170], d: 92, amp: 0.95 },
+    u:  { k: 'V', F: [360, 950, 2450], B: [100, 120, 170], d: 80, amp: 0.85 },
+    '@': { k: 'V', F: [500, 1450, 2550], B: [130, 130, 180], d: 55, amp: 0.80 },
+    w:  { k: 'G', F: [320, 760, 2300], B: [80, 110, 170], d: 55, amp: 0.66 },
+    y:  { k: 'G', F: [290, 2250, 3000], B: [80, 110, 170], d: 55, amp: 0.62 },
+    l:  { k: 'G', F: [390, 1450, 2800], B: [90, 120, 180], d: 62, amp: 0.62 },
+    r:  { k: 'R', F: [450, 1400, 2150], B: [90, 120, 180], d: 50, amp: 0.60 },
+    m:  { k: 'M', F: [270, 1050, 2200], B: [70, 150, 220], nz: 1100, d: 68, amp: 0.50 },
+    n:  { k: 'M', F: [270, 1650, 2600], B: [70, 150, 220], nz: 1750, d: 62, amp: 0.50 },
+    N:  { k: 'M', F: [270, 1900, 2500], B: [70, 150, 220], nz: 2400, d: 75, amp: 0.50 },
+    s:  { k: 'F', fc: 6400, fb: 3000, af: 0.56, voiced: 0, d: 95 },
+    z:  { k: 'F', fc: 6200, fb: 3000, af: 0.40, voiced: 1, d: 80 },
+    S:  { k: 'F', fc: 3300, fb: 2000, af: 0.75, voiced: 0, d: 100 },
+    f:  { k: 'F', fc: 4800, fb: 6000, af: 0.09, voiced: 0, d: 85 },
+    v:  { k: 'F', fc: 4800, fb: 6000, af: 0.08, voiced: 1, d: 70 },
+    h:  { k: 'H', d: 70 },
+    p:  { k: 'P', voiced: 0, loc: [900, 2300], kk: 0.50, bc: 1500, bb: 3000, ba: 0.55, clo: 55, vot: 14 },
+    b:  { k: 'P', voiced: 1, loc: [900, 2300], kk: 0.50, bc: 1500, bb: 3000, ba: 0.40, clo: 48, vot: 5 },
+    t:  { k: 'P', voiced: 0, loc: [1700, 2900], kk: 0.40, bc: 4800, bb: 3200, ba: 0.70, clo: 50, vot: 16 },
+    d:  { k: 'P', voiced: 1, loc: [1700, 2900], kk: 0.40, bc: 4500, bb: 3000, ba: 0.50, clo: 42, vot: 6 },
+    k:  { k: 'P', voiced: 0, velar: 1, bc: 2200, bb: 2200, ba: 0.65, clo: 55, vot: 22 },
+    g:  { k: 'P', voiced: 1, velar: 1, bc: 2000, bb: 2000, ba: 0.50, clo: 45, vot: 8 },
+    tS: { k: 'A', voiced: 0, fc: 3600, fb: 2200, af: 0.66, clo: 40, d: 70 },
+    dZ: { k: 'A', voiced: 1, fc: 3400, fb: 2200, af: 0.50, clo: 36, d: 60 }
+  };
+
+  /* ---------------- voice styles ---------------- */
+  var STYLES = {
+    normal:  { pitch: 1.00, range: 1.00, rate: 1.00, amp: 1.00, oq: 0.60, tilt: 3800, breath: 0.03, jitter: 0.004, vib: 0.000, vibHz: 5.5, voiced: 1, drop: 0 },
+    excited: { pitch: 1.10, range: 1.55, rate: 1.14, amp: 1.10, oq: 0.55, tilt: 5600, breath: 0.02, jitter: 0.005, vib: 0.008, vibHz: 6.0, voiced: 1, drop: 0 },
+    whisper: { pitch: 1.00, range: 0.00, rate: 0.95, amp: 0.55, oq: 0.60, tilt: 3800, breath: 0.00, jitter: 0.000, vib: 0.000, vibHz: 5.0, voiced: 0, drop: 0 },
+    shout:   { pitch: 1.20, range: 1.30, rate: 0.96, amp: 1.35, oq: 0.46, tilt: 8000, breath: 0.01, jitter: 0.010, vib: 0.004, vibHz: 6.0, voiced: 1, drop: 0 },
+    sob:     { pitch: 0.97, range: 1.25, rate: 0.80, amp: 0.80, oq: 0.74, tilt: 2300, breath: 0.12, jitter: 0.020, vib: 0.030, vibHz: 5.3, voiced: 1, drop: 0.07 },
+    soft:    { pitch: 0.94, range: 0.80, rate: 0.90, amp: 0.78, oq: 0.70, tilt: 2600, breath: 0.07, jitter: 0.004, vib: 0.000, vibHz: 5.0, voiced: 1, drop: 0 }
+  };
+
+  var DEFAULTS = { pitch: 255, formant: 1.10, rate: 1.0, pauses: 1.0, style: 'normal', volume: 1.0, seed: 7, lead: 45 };
+
+  /* ---------------- planning: phones -> timed segments -> parameter tracks ---------------- */
+  function scaleF(F, fs) { return [F[0] * fs, F[1] * fs, F[2] * fs]; }
+  function ref(T, i, fs) {                                                               /* formants of the nearest vowel (next first, else previous) */
+    var j;
+    for (j = i + 1; j < T.length && T[j].p !== '_'; j++) if (isVow(T[j].p)) return scaleF(PH[T[j].p].F, fs);
+    for (j = i - 1; j >= 0 && T[j].p !== '_'; j--) if (isVow(T[j].p)) return scaleF(PH[T[j].p].F, fs);
+    return scaleF(PH['@'].F, fs);
+  }
+  function locus(e, rf, fs) {
+    var F;
+    if (e.velar) { var f2 = clamp(rf[1] * 1.04, 1250 * fs, 2450 * fs); F = [260 * fs, f2, f2 + 480]; }
+    else F = [260 * fs, (1 - e.kk) * e.loc[0] * fs + e.kk * rf[1], (1 - 0.3) * e.loc[1] * fs + 0.3 * rf[2]];
+    return F;
+  }
+
+  function plan(text, opts) {
+    opts = opts || {};
+    var o = {}, k;
+    for (k in DEFAULTS) o[k] = opts[k] !== undefined ? opts[k] : DEFAULTS[k];
+    var st = STYLES[o.style] || STYLES.normal, fs = o.formant, rate = Math.max(0.4, o.rate * st.rate), crate = Math.pow(rate, 0.65);
+    var base = o.pitch * st.pitch;
+    var g = L.G2P.phonemize(text), T = g.tokens, i;
+
+    /* phrases: runs of tokens between pauses; the final token tells how the phrase ends */
+    var phrases = [], cur = { vs: [], first: -1, last: -1, end: '.' };
+    for (i = 0; i < T.length; i++) {
+      if (T[i].p === '_') { if (cur.first >= 0) { phrases.push(cur); cur = { vs: [], first: -1, last: -1, end: '.' }; } continue; }
+      if (cur.first < 0) cur.first = i;
+      cur.last = i; T[i].phr_i = phrases.length;
+      if (isVow(T[i].p)) cur.vs.push(i);
+    }
+    if (cur.first >= 0) phrases.push(cur);
+    phrases.forEach(function (ph) { var lt = T[ph.last]; ph.end = lt.end || (lt.phr ? ',' : '.'); });
+
+    /* segments */
+    var segs = [];
+    function add(s) { segs.push(s); return s; }
+    for (i = 0; i < T.length; i++) {
+      var t = T[i], p = t.p, e = PH[p], phr = phrases[t.phr_i], amp = (t.caps ? 1.2 : 1) * (t.st ? 1 : 0.88), prev = T[i - 1], nxt = T[i + 1];
+      if (p === '_') { add({ tk: i, ph: '_', k: 'pause', d: t.ms * o.pauses / Math.sqrt(rate) }); continue; }
+      if (!e) continue;
+      var consBefore = prev && prev.p !== '_' && !isVow(prev.p), d;
+      if (e.k === 'V') {
+        d = e.d * (t.st ? 1.22 : 1) * (t.lng || 1) * (t.caps ? 1.1 : 1);
+        var fin = phr && phr.vs[phr.vs.length - 1] === i;
+        if (fin) d *= phr.end === ',' ? 1.12 : 1.35;
+        add({ tk: i, ph: p, k: 'V', d: d / rate, amp: amp, stress: t.st });
+      } else if (e.k === 'G' || e.k === 'R') {
+        d = e.d * (consBefore ? 0.9 : 1) / crate;
+        add({ tk: i, ph: p, k: e.k, d: d, amp: amp });
+      } else if (e.k === 'M') {
+        d = e.d * (consBefore ? 0.88 : 1) * (t.lng || 1) / crate;
+        add({ tk: i, ph: p, k: 'M', d: d, amp: amp });
+      } else if (e.k === 'F') {
+        d = e.d * (consBefore ? 0.9 : 1) * (t.lng || 1) / crate;
+        add({ tk: i, ph: p, k: 'F', d: d, amp: amp });
+      } else if (e.k === 'H') {
+        var between = prev && isVow(prev.p) && nxt && isVow(nxt.p);
+        d = e.d * (t.lng || 1) / crate;
+        add({ tk: i, ph: p, k: 'H', d: d, amp: amp, voicedH: between });
+      } else if (e.k === 'P') {
+        var weak = !nxt || nxt.p === '_' || !isVow(nxt.p) ? 0.6 : 1;
+        add({ tk: i, ph: p, k: 'clo', d: e.clo * (consBefore ? 0.85 : 1) / crate, amp: amp });
+        add({ tk: i, ph: p, k: 'burst', d: 10, amp: amp * weak });
+        add({ tk: i, ph: p, k: 'asp', d: e.vot / crate * (weak < 1 ? 0.6 : 1), amp: amp });
+      } else if (e.k === 'A') {
+        add({ tk: i, ph: p, k: 'clo', d: e.clo / crate, amp: amp });
+        add({ tk: i, ph: p, k: 'fr', d: e.d / crate, amp: amp });
+      }
+    }
+
+    if (segs.length && segs[segs.length - 1].k === 'pause') segs[segs.length - 1].d = Math.min(segs[segs.length - 1].d, 110);   /* no long silent tail */
+    /* times (ms) */
+    var tms = o.lead;
+    segs.forEach(function (s) { s.t0 = tms; tms += s.d; s.t1 = tms; });
+    var totalMs = tms + 60;
+
+    /* frames: target parameter values of each segment */
+    function frameOf(s) {
+      var e = PH[s.ph], f = { F: null, B: [80, 110, 160], av: 0, af: 0, ah: 0, ab: 0, nm: 0, fc: 5000, fb: 3000, nz: 1500 }, rf, ix = s.tk;
+      if (s.k === 'pause') { f.F = scaleF(PH['@'].F, fs); return f; }
+      rf = ref(T, ix, fs);
+      switch (s.k) {
+        case 'V': case 'G': case 'R': f.F = scaleF(e.F, fs); f.B = e.B; f.av = e.amp * s.amp; f.ah = 0; break;
+        case 'M': f.F = scaleF(e.F, fs); f.B = e.B; f.av = e.amp * s.amp; f.nm = 1; f.nz = e.nz * fs; break;
+        case 'F': f.F = [380 * fs, 0.55 * 1500 * fs + 0.45 * rf[1], 2500 * fs]; f.av = e.voiced ? 0.30 * s.amp : 0; f.af = e.af * s.amp; f.fc = e.fc * (fs > 1 ? 1 + (fs - 1) * 0.5 : 1); f.fb = e.fb; break;
+        case 'H': f.F = rf; f.ah = 0.07 * s.amp; f.av = s.voicedH ? 0.11 : 0; break;
+        case 'clo': f.F = e.k === 'A' ? [300 * fs, 1700 * fs, 2700 * fs] : locus(e, rf, fs); f.av = e.voiced ? 0.08 : 0; break;
+        case 'burst':
+          f.F = locus(e, rf, fs); f.ab = e.ba * s.amp; f.av = e.voiced ? 0.15 : 0;
+          f.fc = e.velar ? clamp(f.F[1] * 1.05, 1500, 3400) : e.bc * (fs > 1 ? 1 + (fs - 1) * 0.5 : 1); f.fb = e.bb; break;
+        case 'asp': f.F = locus(e, rf, fs); f.ah = e.voiced ? 0.10 : 0.60 * s.amp; f.av = e.voiced ? 0.45 : 0; break;
+        case 'fr': f.F = [330 * fs, 1700 * fs, 2700 * fs]; f.af = e.af * s.amp; f.av = e.voiced ? 0.28 : 0; f.fc = e.fc * (fs > 1 ? 1 + (fs - 1) * 0.5 : 1); f.fb = e.fb; break;
+      }
+      if (!f.F) f.F = scaleF(PH['@'].F, fs);
+      return f;
+    }
+    var voc = function (s) { return s.k === 'V' || s.k === 'G' || s.k === 'R'; };
+    var frames = segs.map(frameOf);
+    for (i = 0; i < segs.length; i++) if (segs[i].k === 'pause') {                          /* a pause keeps the previous formants */
+      frames[i].F = i ? frames[i - 1].F : scaleF(PH['@'].F, fs); frames[i].B = i ? frames[i - 1].B : [80, 110, 160];
+    }
+
+    function fwin(a, b) {                                                                  /* formant transition windows (ms): [inside a, inside b] */
+      if (a.k === 'pause' || b.k === 'pause') return [0, 0];
+      if (a.k === 'H' || b.k === 'H') return [6, 6];
+      var va = voc(a), vb = voc(b);
+      if (va && vb) return [26, 26];
+      if (!va && vb) return [Math.min(8, a.d * 0.5), 38];
+      if (va && !vb) return [32, Math.min(8, b.d * 0.5)];
+      return [10, 10];
+    }
+    function awin(a, b) {                                                                  /* amplitude windows (ms) */
+      if (a.k === 'pause') return [0, 12];
+      if (b.k === 'pause') return [Math.min(24, a.d * 0.5), 0];
+      var va = voc(a), vb = voc(b);
+      if ((va && vb) || (a.k === 'M' && vb) || (va && b.k === 'M')) return [12, 12];
+      if (a.k === 'H' || b.k === 'H') return [8, 8];
+      if (a.k === 'asp' && vb) return [6, 8];
+      return [4, 4];
+    }
+    function build(wf, keys) {
+      var out = [], n = segs.length, ins = [], outs = [], s, j2;
+      for (j2 = 0; j2 < n; j2++) { ins.push(0); outs.push(0); }
+      for (j2 = 0; j2 < n - 1; j2++) {
+        var w = wf(segs[j2], segs[j2 + 1]);
+        outs[j2] = w[0]; ins[j2 + 1] = w[1];
+      }
+      for (j2 = 0; j2 < n; j2++) {
+        s = segs[j2];
+        var tot = ins[j2] + outs[j2], lim = s.d * 0.9;
+        if (tot > lim) { var sc = lim / tot; ins[j2] *= sc; outs[j2] *= sc; }
+        [s.t0 + ins[j2], s.t1 - outs[j2]].forEach(function (tt) { var kf = { t: tt / 1000 }; keys(kf, frames[j2], s); out.push(kf); });
+      }
+      return out;
+    }
+    var ftrack = build(fwin, function (kf, f) { kf.F1 = f.F[0]; kf.F2 = f.F[1]; kf.F3 = f.F[2]; kf.B1 = f.B[0]; kf.B2 = f.B[1]; kf.B3 = f.B[2]; });
+    var atrack = build(awin, function (kf, f) { kf.av = f.av; kf.af = f.af; kf.ah = f.ah; kf.ab = f.ab; kf.nm = f.nm; kf.fc = f.fc; kf.fb = f.fb; kf.nz = f.nz; });
+    /* glottal-stop-like dip between adjacent vowels (maaga, saan) and a flap dip inside r */
+    var dips = [];
+    for (i = 0; i < segs.length - 1; i++) {
+      if (segs[i].k === 'V' && segs[i + 1].k === 'V') dips.push({ t: segs[i].t1 / 1000, k: 0.35 });
+      if (segs[i].k === 'R') dips.push({ t: (segs[i].t0 + segs[i].d * 0.5) / 1000, k: 0.25 });
+    }
+    dips.forEach(function (dp) {
+      var at = dp.t, a0 = null, a1 = null, q;
+      for (q = 0; q < atrack.length; q++) { if (atrack[q].t <= at) a0 = q; else { a1 = q; break; } }
+      if (a0 === null || a1 === null) return;
+      var u = (at - atrack[a0].t) / Math.max(1e-6, atrack[a1].t - atrack[a0].t), kf = { t: at };
+      ['av', 'af', 'ah', 'ab', 'nm', 'fc', 'fb', 'nz'].forEach(function (key) { kf[key] = atrack[a0][key] + (atrack[a1][key] - atrack[a0][key]) * u; });
+      kf.av *= dp.k;
+      var pre = { t: at - 0.008 }, post = { t: at + 0.008 };
+      ['av', 'af', 'ah', 'ab', 'nm', 'fc', 'fb', 'nz'].forEach(function (key) {
+        pre[key] = atrack[a0][key] + (atrack[a1][key] - atrack[a0][key]) * clamp((pre.t - atrack[a0].t) / Math.max(1e-6, atrack[a1].t - atrack[a0].t), 0, 1);
+        post[key] = atrack[a0][key] + (atrack[a1][key] - atrack[a0][key]) * clamp((post.t - atrack[a0].t) / Math.max(1e-6, atrack[a1].t - atrack[a0].t), 0, 1);
+      });
+      if (pre.t > atrack[a0].t && post.t < atrack[a1].t) atrack.splice(a1, 0, pre, kf, post);
+    });
+
+    /* pitch contour (Hz) */
+    var f0track = [], pm = function (m) { return 1 + (m - 1) * st.range; };
+    function pushF0(tt, hz) { f0track.push({ t: tt / 1000, f0: hz }); }
+    segs.forEach(function (s) {
+      if (s.k !== 'V') return;
+      var phr = phrases[T[s.tk].phr_i], n = phr.vs.length, idx = phr.vs.indexOf(s.tk), pr = n > 1 ? idx / (n - 1) : 0;
+      var m = 1 + (0.5 - pr) * 0.16 + (idx === 0 ? 0.04 : 0);
+      if (T[s.tk].caps) m *= 1.12;
+      var m0 = m * (s.stress ? 0.98 : 0.995), m1 = m * (s.stress ? 1.07 : 0.97);
+      if (idx === n - 1) {
+        if (phr.end === '?') { m0 = m * 0.97; m1 = m * 1.32; }
+        else if (phr.end === '!') { m0 = m * 1.08; m1 = m * 0.86; }
+        else if (phr.end === ',') { m1 = m * 1.06; }
+        else m1 = m * 0.80;
+      }
+      pushF0(s.t0, base * pm(m0)); pushF0(s.t1, base * pm(m1));
+    });
+    if (!f0track.length) pushF0(0, base);
+    f0track.unshift({ t: 0, f0: f0track[0].f0 });
+    if (st.drop) f0track.forEach(function (kf) { kf.f0 *= Math.max(0.6, 1 - st.drop * kf.t); });
+
+    /* timeline per token, words */
+    var tl = [], byTok = {};
+    segs.forEach(function (s) {
+      var q = byTok[s.tk];
+      if (!q) { q = byTok[s.tk] = { tk: s.tk, ph: s.ph, t0: s.t0 / 1000, t1: s.t1 / 1000, w: T[s.tk].w, st: T[s.tk].st ? 1 : 0, k: s.k === 'clo' || s.k === 'burst' || s.k === 'asp' ? 'P' : s.k }; tl.push(q); }
+      else q.t1 = s.t1 / 1000;
+    });
+    var words = g.words.map(function (w) {
+      var a = byTok[w.first], b = byTok[w.last];
+      return { text: w.text, start: w.start, end: w.end, t0: a ? a.t0 : 0, t1: b ? b.t1 : 0 };
+    });
+
+    return { sr: SR, text: text, opts: o, style: st, styleName: o.style, segs: segs, frames: frames, ftrack: ftrack, atrack: atrack, f0track: f0track,
+      timeline: tl, words: words, tokens: T, duration: totalMs / 1000, phrases: phrases.length };
+  }
+
+  /* ---------------- rendering ---------------- */
+  function Track(kfs, keys) {
+    var idx = 0, n = kfs.length, v = {};
+    keys.forEach(function (k) { v[k] = kfs.length ? kfs[0][k] : 0; });
+    return {
+      v: v,
+      at: function (t) {
+        if (!n) return v;
+        var k, key;
+        if (t <= kfs[0].t) { for (k = 0; k < keys.length; k++) v[keys[k]] = kfs[0][keys[k]]; return v; }
+        while (idx < n - 1 && kfs[idx + 1].t <= t) idx++;
+        var a = kfs[idx], b = kfs[Math.min(idx + 1, n - 1)], u = (b.t > a.t && t > a.t) ? Math.min(1, (t - a.t) / (b.t - a.t)) : 0;
+        for (k = 0; k < keys.length; k++) { key = keys[k]; v[key] = a[key] + (b[key] - a[key]) * u; }
+        return v;
+      }
+    };
+  }
+
+  var GAIN = { voice: 0.35, asp: 0.45, fric: 0.55, burst: 0.45, nasal: 0.50 };
+
+  function render(pl) {
+    var st = pl.style, o = pl.opts, n = Math.ceil((pl.duration + 0.05) * SR), out = new Float32Array(n);
+    var rnd = rngMake(o.seed * 7919 + 17), rnd2 = rngMake(o.seed * 104729 + 3);
+    var R = [new Res(), new Res(), new Res(), new Res(), new Res()], RNP = new Res(), RNZ = new Anti(), BPf = new BP();
+    var ft = Track(pl.ftrack, ['F1', 'F2', 'F3', 'B1', 'B2', 'B3']);
+    var at = Track(pl.atrack, ['av', 'af', 'ah', 'ab', 'nm', 'fc', 'fb', 'nz']);
+    var p0 = Track(pl.f0track, ['f0']);
+    var fs = o.formant, F4 = 3500 * fs, F5 = 4500 * fs, B4 = 260, B5 = 330;
+    var oq = st.oq, tiltK = 1 - Math.exp(-TAU * st.tilt / SR), tl = 0, phase = 0, jit = 1, voiced = st.voiced;
+    var dcx = 0, dcy = 0, BLOCK = 16, vol = o.volume * st.amp, nBlocks = Math.ceil(n / BLOCK), avB = new Float32Array(nBlocks);
+    RNP.set(280 * fs, 90);
+    R[3].set(F4, B4); R[4].set(F5, B5);
+    for (var i = 0; i < n; i += BLOCK) {
+      var t = i / SR, F = ft.at(t), A = at.at(t), f0 = p0.at(t).f0;
+      R[0].set(F.F1, F.B1); R[1].set(F.F2, F.B2); R[2].set(F.F3, F.B3);
+      var nm = clamp(A.nm, 0, 1);
+      avB[i / BLOCK] = (A.af < 0.04 && A.ab < 0.04 && A.ah < 0.2 && A.av > 0.25) ? A.av : 0;     /* voiced sonorant frames feed the leveler */
+      if (nm > 0.01) RNZ.set(A.nz, 120);
+      if (A.af > 0.001 || A.ab > 0.001) BPf.set(A.fc, A.fb);
+      var vib = st.vib ? 1 + st.vib * Math.sin(TAU * st.vibHz * t) : 1;
+      var end = Math.min(n, i + BLOCK);
+      for (var j = i; j < end; j++) {
+        var dt = f0 * vib * jit / SR;
+        phase += dt;
+        if (phase >= 1) { phase -= 1; if (st.jitter) jit = 1 + st.jitter * rnd2(); }
+        var open = phase < oq, x = phase / oq, gs = open ? (2 * x - 3 * x * x) : 0, tt = phase - oq;
+        if (tt < 0) tt += 1;
+        gs += 0.5 * blep(tt, dt);
+        tl += tiltK * (gs - tl);
+        var noise = rnd(), src;
+        if (voiced) src = A.av * tl * GAIN.voice + (A.ah + A.av * st.breath) * noise * GAIN.asp * (open ? 1 : 0.4);
+        else src = (A.av * 0.9 + A.ah) * noise * GAIN.asp;
+        if (nm > 0.01) src = (1 - nm) * src + nm * RNZ.run(RNP.run(src)) * GAIN.nasal;
+        var xv = R[4].run(R[3].run(R[2].run(R[1].run(R[0].run(src)))));
+        var fr = 0;
+        if (A.af > 0.001 || A.ab > 0.001) fr = BPf.run(noise) * (A.af * GAIN.fric + A.ab * GAIN.burst);
+        var y = xv + fr;
+        dcy = y - dcx + 0.995 * dcy; dcx = y;                                          /* DC block */
+        out[j] = dcy * vol;
+      }
+    }
+    /* leveler: harmonic-vs-formant alignment makes some syllables 6-10 dB louder than others. Pull every voiced
+     * sonorant block towards the utterance's median level (gain limited to x0.5 .. x2, smoothed over ~25 ms). */
+    var k, cs = new Float64Array(n + 1);
+    for (k = 0; k < n; k++) cs[k + 1] = cs[k] + out[k] * out[k];
+    var half = Math.round(0.010 * SR), ratios = [], rms = new Float32Array(nBlocks), b;
+    for (b = 0; b < nBlocks; b++) {
+      if (avB[b] > 0) {
+        var c = b * BLOCK + BLOCK / 2, lo = Math.max(0, c - half), hi = Math.min(n, c + half);
+        rms[b] = Math.sqrt((cs[hi] - cs[lo]) / Math.max(1, hi - lo));
+        if (rms[b] > 1e-7) ratios.push(rms[b] / avB[b]);
+      }
+    }
+    if (ratios.length > 3) {
+      ratios.sort(function (x, y) { return x - y; });
+      var refLvl = ratios[ratios.length >> 1], gS = 1, kS = 1 - Math.exp(-BLOCK / (0.025 * SR));
+      for (b = 0; b < nBlocks; b++) {
+        var want = (avB[b] > 0 && rms[b] > 1e-7) ? clamp(refLvl * avB[b] / rms[b], 0.5, 2.0) : 1;
+        gS += kS * (want - gS);
+        for (k = b * BLOCK; k < Math.min(n, (b + 1) * BLOCK); k++) out[k] *= gS;
+      }
+    }
+    /* normalise, then a soft limiter so peaks never clip */
+    var peak = 0;
+    for (k = 0; k < n; k++) { var a = Math.abs(out[k]); if (a > peak) peak = a; }
+    var norm = peak > 1e-9 ? 0.88 / peak : 1;
+    for (k = 0; k < n; k++) { var v = out[k] * norm; out[k] = Math.tanh(v * 1.25) / Math.tanh(1.25); }
+    var fade = Math.round(0.004 * SR);                                                  /* 4 ms edges */
+    for (k = 0; k < fade && k < n; k++) { out[k] *= k / fade; out[n - 1 - k] *= k / fade; }
+    return out;
+  }
+
+  function synth(text, opts) {
+    var pl = plan(text, opts), pcm = render(pl);
+    return { pcm: pcm, sampleRate: SR, duration: pcm.length / SR, plan: pl, timeline: pl.timeline, words: pl.words };
+  }
+
+  /* Hand-built plan for sound effects (giggle, scream, sob ...). Rows are keyframes, times in seconds:
+   *   spec = { duration, style, styleOverride, opts, f0: [[t, hz]], F: [[t, F1, F2, F3, B1, B2, B3]], A: [[t, av, ah, af, ab, nasal, fc, fb, nz]] } */
+  function custom(spec) {
+    var o = {}, st = {}, k, base = STYLES[spec.style] || STYLES.normal;
+    for (k in DEFAULTS) o[k] = spec.opts && spec.opts[k] !== undefined ? spec.opts[k] : DEFAULTS[k];
+    for (k in base) st[k] = base[k];
+    if (spec.styleOverride) for (k in spec.styleOverride) st[k] = spec.styleOverride[k];
+    return {
+      sr: SR, text: '', opts: o, style: st, styleName: spec.style || 'normal', segs: [], frames: [], timeline: [], words: [], tokens: [], phrases: 0, duration: spec.duration,
+      f0track: spec.f0.map(function (r) { return { t: r[0], f0: r[1] }; }),
+      ftrack: spec.F.map(function (r) { return { t: r[0], F1: r[1], F2: r[2], F3: r[3], B1: r[4] || 100, B2: r[5] || 120, B3: r[6] || 170 }; }),
+      atrack: spec.A.map(function (r) { return { t: r[0], av: r[1] || 0, ah: r[2] || 0, af: r[3] || 0, ab: r[4] || 0, nm: r[5] || 0, fc: r[6] || 4000, fb: r[7] || 3000, nz: r[8] || 1500 }; })
+    };
+  }
+
+  L.LeonSynth = { SAMPLE_RATE: SR, PHONES: PH, STYLES: STYLES, DEFAULTS: DEFAULTS, plan: plan, render: render, synth: synth,
+    custom: custom, renderCustom: function (spec) { return render(custom(spec)); },
+    dsp: { Res: Res, Anti: Anti, BP: BP, rng: rngMake, blep: blep } };
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/voice/lipsync.js ===== */
+/* Leon Offline — lipsync.js
+ * Turns a phone timeline into mouth shapes for the avatar (visemes X M A E I O U F L S, see avatar/face.js).
+ *   LeonSynth voice  : exact timeline from the synthesizer, played against the audio clock.
+ *   Device TTS voice : an estimated timeline (same planner, no samples), stretched to the expected length and
+ *                      re-aligned whenever the engine reports a word boundary.
+ *   Muted ("mouthing") : the same estimate, played on the wall clock with no sound at all.
+ *
+ *   var keys = Leon.Lipsync.fromTimeline(synth.timeline);
+ *   var player = new Leon.Lipsync.Player();  player.start(keys, now);
+ *   every frame:  var m = player.mouth(now);  avatar.setMouth(m.v, m.open);   // m.v === 'X' means "rest"
+ * No DOM, no network. Times are seconds. */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  var LP = L.Lipsync = {};
+
+  var VOWEL = { a: ['A', 1.18], e: ['E', 0.92], i: ['I', 0.62], o: ['O', 0.98], u: ['U', 0.62], '@': ['E', 0.58] };
+  var LIPS = { p: ['M', 0.15], b: ['M', 0.15], m: ['M', 0.15], f: ['F', 0.45], v: ['F', 0.45], w: ['U', 0.55] };
+  var TEETH = { s: ['S', 0.42], z: ['S', 0.42], S: ['S', 0.5], tS: ['S', 0.5], dZ: ['S', 0.5] };
+  var TONGUE = { l: ['L', 0.62] };
+
+  /* timeline entries are {ph, t0, t1, st, w, k}; returns [{t0, t1, v, open, ph}] with rests as v:'X' */
+  LP.fromTimeline = function (tl) {
+    var keys = [], i, j, e, o, m;
+    function vowelNear(i0, dir, limit) {
+      for (var q = i0 + dir, n = 0; q >= 0 && q < tl.length && n < 4; q += dir, n++) {
+        var x = tl[q];
+        if (x.ph === '_') return null;
+        if (Math.abs(x.t0 - tl[i0].t0) > limit) return null;
+        if (VOWEL[x.ph]) return VOWEL[x.ph];
+      }
+      return null;
+    }
+    for (i = 0; i < tl.length; i++) {
+      e = tl[i];
+      if (e.ph === '_') { keys.push({ t0: e.t0, t1: e.t1, v: 'X', open: 0, ph: '_' }); continue; }
+      if (VOWEL[e.ph]) {
+        m = VOWEL[e.ph]; o = m[1] * (e.st ? 1.12 : 0.94);
+        keys.push({ t0: e.t0, t1: e.t1, v: m[0], open: Math.min(1.4, o), ph: e.ph });
+      } else if (LIPS[e.ph]) {
+        m = LIPS[e.ph]; var dur = e.t1 - e.t0;
+        if (m[0] === 'M' && dur > 0.03) {                                          /* closed through the closure, then open for the release */
+          keys.push({ t0: e.t0, t1: e.t0 + dur * 0.72, v: 'M', open: 0.1, ph: e.ph });
+          var nv = vowelNear(i, 1, 0.2) || vowelNear(i, -1, 0.2) || ['E', 0.5];
+          keys.push({ t0: e.t0 + dur * 0.72, t1: e.t1, v: nv[0], open: nv[1] * 0.5, ph: e.ph });
+        } else keys.push({ t0: e.t0, t1: e.t1, v: m[0], open: m[1], ph: e.ph });
+      } else if (TEETH[e.ph]) {
+        m = TEETH[e.ph]; keys.push({ t0: e.t0, t1: e.t1, v: m[0], open: m[1], ph: e.ph });
+      } else if (TONGUE[e.ph]) {
+        m = TONGUE[e.ph]; keys.push({ t0: e.t0, t1: e.t1, v: m[0], open: m[1], ph: e.ph });
+      } else {                                                                      /* tongue / throat sounds (t d n r k g N h y) and anything unknown: lips keep the vowel's shape */
+        m = vowelNear(i, 1, 0.22) || vowelNear(i, -1, 0.22) || ['E', 0.55];
+        keys.push({ t0: e.t0, t1: e.t1, v: m[0], open: Math.max(0.3, m[1] * 0.55), ph: e.ph });
+      }
+    }
+    /* very short non-lip keys (taps, bursts) are folded into their neighbour so the mouth does not flicker */
+    var out = [];
+    for (j = 0; j < keys.length; j++) {
+      var k = keys[j], prev = out[out.length - 1];
+      if (prev && k.t1 - k.t0 < 0.03 && k.v !== 'M' && prev.v !== 'X' && k.v !== 'X') { prev.t1 = k.t1; continue; }
+      out.push(k);
+    }
+    return out;
+  };
+
+  /* binary search; returns the key covering t, or null (silence before / after) */
+  LP.keyAt = function (keys, t) {
+    var lo = 0, hi = keys.length - 1, mid;
+    if (!keys.length || t < keys[0].t0 || t > keys[hi].t1) return null;
+    while (lo <= hi) {
+      mid = (lo + hi) >> 1;
+      if (t < keys[mid].t0) hi = mid - 1; else if (t >= keys[mid].t1) lo = mid + 1; else return keys[mid];
+    }
+    return keys[Math.min(Math.max(lo, 0), keys.length - 1)];
+  };
+
+  /* generic talking motion for when the real timing is unknown */
+  var FLAP = [['A', 1.0], ['E', 0.75], ['O', 0.9], ['E', 0.6], ['A', 1.1], ['I', 0.55], ['U', 0.6], ['E', 0.8]];
+  LP.flap = function (t, out) {
+    var ph = t * 4.6, idx = Math.floor(ph), f = ph - idx, sh = FLAP[((idx % FLAP.length) + FLAP.length) % FLAP.length];
+    var pulse = Math.sin(Math.PI * Math.min(1, f * 1.15));
+    out.v = pulse < 0.12 ? 'M' : sh[0]; out.open = Math.max(0.12, sh[1] * pulse); return out;
+  };
+
+  /* Estimate a timeline for text we cannot synthesize here (device TTS, or muted mouthing).
+   * Uses the LeonSynth planner when it is loaded (no samples are rendered), else a crude vowel-group estimate. */
+  LP.estimate = function (text, opts) {
+    opts = opts || {};
+    var tl, words = [], dur;
+    if (L.LeonSynth && L.LeonSynth.plan) {
+      var pl = L.LeonSynth.plan(text, { rate: opts.rate || 1, style: opts.style || 'normal' });
+      tl = pl.timeline; words = pl.words; dur = pl.duration;
+    } else {
+      tl = []; dur = 0.05;
+      var syl = String(text).toLowerCase().match(/[aeiouáéíóú]+|[^aeiouáéíóú\s]+|\s+/g) || [];
+      syl.forEach(function (s) {
+        var isV = /^[aeiou]/.test(s), d = /^\s/.test(s) ? 0.06 : (isV ? 0.11 : 0.06) * s.length;
+        tl.push({ ph: /^\s/.test(s) ? '_' : (isV ? s.charAt(0) : s.charAt(0)), t0: dur, t1: dur + d, st: 1, w: 0, k: isV ? 'V' : 'C' }); dur += d;
+      });
+    }
+    return { keys: LP.fromTimeline(tl), words: words, duration: dur, timeline: tl };
+  };
+
+  /* Expected speaking time (seconds) of the device TTS for `text` at its rate setting: ~13.5 characters per second. */
+  LP.expectedSeconds = function (text, rate) {
+    var n = String(text || '').replace(/\s+/g, ' ').trim().length;
+    return Math.max(0.35, n / 13.5 / Math.max(0.4, rate || 1)) + 0.12;
+  };
+
+  /* ------------- Player ------------- */
+  function Player() { this.out = { v: 'X', open: 0, active: false, ph: '' }; this.keys = null; this.cur = 0; this.last = 0; this.endless = false; this.scale = 1; this.sT = 0; this.nT = 0; this.words = []; this._lastB = null; }
+  LP.Player = Player;
+
+  /* keys: from fromTimeline; now: wall/audio clock in seconds; opts.scale: wall seconds per speech second; opts.endless: keep flapping past the end */
+  Player.prototype.start = function (keys, now, opts) {
+    opts = opts || {};
+    this.keys = keys || []; this.scale = opts.scale > 0 ? opts.scale : 1; this.endless = !!opts.endless; this.words = opts.words || [];
+    this.sT = 0; this.nT = now; this.last = now; this.cur = 0; this._lastB = null; this.out.active = true;
+    this.end = this.keys.length ? this.keys[this.keys.length - 1].t1 : 0;
+  };
+  Player.prototype.stop = function () { this.keys = null; this.out.v = 'X'; this.out.open = 0; this.out.active = false; this.cur = 0; };
+  Player.prototype.speechTime = function (now) { return this.sT + (now - this.nT) / this.scale; };
+  /* the engine says: speech time `sT` is happening now. Adapts the playback speed from consecutive anchors. */
+  Player.prototype.anchor = function (sT, now) {
+    if (this._lastB && sT > this._lastB.s + 0.15 && now > this._lastB.n) {
+      var sc = (now - this._lastB.n) / (sT - this._lastB.s);
+      if (sc > 0.4 && sc < 2.5) this.scale = this.scale * 0.5 + sc * 0.5;
+    }
+    this._lastB = { s: sT, n: now };
+    this.sT = sT; this.nT = now;
+  };
+  /* word index (from words[]) -> speech time of its start */
+  Player.prototype.anchorWord = function (wi, now) {
+    var w = this.words[wi]; if (!w) return;
+    this.anchor(w.t0, now);
+  };
+  Player.prototype.finishing = function () { this.endless = false; };
+
+  Player.prototype.mouth = function (now) {
+    var o = this.out;
+    if (!this.keys) { o.v = 'X'; o.open = 0; o.active = false; return o; }
+    var ts = this.speechTime(now), dt = Math.max(0, Math.min(0.1, now - this.last)); this.last = now;
+    var tv = 'X', to = 0, k, tmp;
+    if (ts < 0) { tv = 'X'; to = 0; }
+    else if (ts > this.end + 0.04) {
+      if (this.endless) { tmp = LP.flap(now, { v: 'X', open: 0 }); tv = tmp.v; to = tmp.open; }
+      else { o.active = false; }
+    } else {
+      k = LP.keyAt(this.keys, ts);
+      if (k) { tv = k.v; to = k.open; }
+    }
+    var tau = to > o.open ? 0.035 : 0.065, a = 1 - Math.exp(-dt / tau);
+    o.open += (to - o.open) * (dt ? a : 1);
+    o.v = (tv === 'X' && o.open > 0.2) ? (o.lastV || 'E') : tv;                   /* keep the last shape while the lips close */
+    if (tv !== 'X') o.lastV = tv;
+    if (tv === 'X' && o.open < 0.12) { o.v = 'X'; o.open = 0; }
+    o.ph = k ? k.ph : '';
+    return o;
+  };
+
+  LP.VOWEL = VOWEL;
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/voice/sfx.js ===== */
+/* Leon Offline — sfx.js
+ * Procedural sound effects: nothing to download, nothing recorded. Everything is generated from oscillators, noise
+ * and Leon's own formant synthesizer (LeonSynth), so Leon can giggle, scream, sniffle and sob fully offline.
+ *
+ *   var s = Leon.Sfx.make('giggle');           // { pcm, sampleRate, duration, keys, gain, name }
+ *   Leon.Sfx.names                              // everything available
+ *   Leon.Sfx.forGesture('spin')                 // 'whoosh' (optional automatic sounds for gestures)
+ * `keys` are mouth shapes in the same format as Leon.Lipsync.fromTimeline() (or null when the sound has none).
+ * No DOM, no network. Deterministic: the same call gives the same samples. */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  var SR = 22050, TAU = Math.PI * 2;
+  var X = L.Sfx = { SAMPLE_RATE: SR };
+
+  function LS() { return L.LeonSynth; }
+  function buf(sec) { return new Float32Array(Math.max(1, Math.round(sec * SR))); }
+  function clamp(x, a, b) { return x < a ? a : (x > b ? b : x); }
+  function peakNorm(b, p) {
+    var m = 0, i;
+    for (i = 0; i < b.length; i++) { var a = Math.abs(b[i]); if (a > m) m = a; }
+    if (m > 1e-9) { var k = p / m; for (i = 0; i < b.length; i++) b[i] *= k; }
+    return b;
+  }
+  function fadeEdges(b, ms) {
+    var n = Math.min(b.length >> 1, Math.round(ms / 1000 * SR)), i;
+    for (i = 0; i < n; i++) { var g = i / n; b[i] *= g; b[b.length - 1 - i] *= g; }
+    return b;
+  }
+  function add(dst, src, at, g) {
+    var o = Math.round(at * SR), i;
+    for (i = 0; i < src.length && o + i < dst.length; i++) if (o + i >= 0) dst[o + i] += src[i] * g;
+    return dst;
+  }
+  function rng(seed) { return LS().dsp.rng(seed); }
+
+  /* band-pass noise with time-varying centre / width / loudness */
+  function noiseBand(seed, sec, fc, bw, env) {
+    var r = rng(seed), n = Math.round(sec * SR), out = new Float32Array(n), bp = new (LS().dsp.BP)(), i;
+    for (i = 0; i < n; i++) {
+      var t = i / SR;
+      if (i % 24 === 0) bp.set(fc(t), bw(t));
+      out[i] = bp.run(r()) * env(t);
+    }
+    return out;
+  }
+  function lowNoise(seed, sec, fc, env, poles) {
+    var r = rng(seed), n = Math.round(sec * SR), out = new Float32Array(n), k = 1 - Math.exp(-TAU * fc / SR), st = [0, 0, 0, 0], i, p;
+    for (i = 0; i < n; i++) {
+      var v = r();
+      for (p = 0; p < (poles || 2); p++) { st[p] += k * (v - st[p]); v = st[p]; }
+      out[i] = v * env(i / SR);
+    }
+    return out;
+  }
+  function expEnv(t, a, tau) { return (t < a ? t / a : 1) * Math.exp(-Math.max(0, t - a) / tau); }
+  function bell(t, dur) { var u = clamp(t / dur, 0, 1); return Math.sin(Math.PI * u); }
+
+  /* ---------- the sounds ---------- */
+  var MAKERS = {
+    pop: function () {
+      var b = buf(0.1), ph = 0, i;
+      for (i = 0; i < b.length; i++) { var t = i / SR, f = 170 + 650 * Math.exp(-t / 0.016); ph += TAU * f / SR; b[i] = Math.sin(ph) * expEnv(t, 0.002, 0.03); }
+      return { pcm: b, gain: 0.7 };
+    },
+    boing: function () {
+      var b = buf(0.5), ph = 0, i;
+      for (i = 0; i < b.length; i++) {
+        var t = i / SR, f = 140 + 520 * (1 - Math.exp(-t / 0.045)) * Math.exp(-t / 0.3) + 50 * Math.sin(TAU * 15 * t) * Math.exp(-t / 0.22);
+        ph += TAU * f / SR; b[i] = (Math.sin(ph) + 0.3 * Math.sin(2 * ph + 0.6)) * expEnv(t, 0.004, 0.24);
+      }
+      return { pcm: b, gain: 0.6 };
+    },
+    ding: function () {
+      var b = buf(0.7), i;
+      for (i = 0; i < b.length; i++) {
+        var t = i / SR;
+        b[i] = (Math.sin(TAU * 1318.5 * t) * Math.exp(-t / 0.24) + 0.5 * Math.sin(TAU * 1975.5 * t) * Math.exp(-t / 0.17) + 0.25 * Math.sin(TAU * 2637 * t) * Math.exp(-t / 0.1)) * Math.min(1, t / 0.002);
+      }
+      return { pcm: b, gain: 0.55 };
+    },
+    sparkle: function () {
+      var b = buf(0.5), at = [0, 0.07, 0.14, 0.24], fr = [2093, 2637, 3136, 4186], k, i;
+      for (k = 0; k < at.length; k++) {
+        var s = Math.round(at[k] * SR);
+        for (i = 0; i < 0.14 * SR && s + i < b.length; i++) { var t = i / SR; b[s + i] += Math.sin(TAU * fr[k] * t) * expEnv(t, 0.002, 0.04) * (1 - k * 0.12); }
+      }
+      return { pcm: b, gain: 0.45 };
+    },
+    whoosh: function () {
+      var d = 0.5;
+      return { pcm: noiseBand(11, d, function (t) { return 450 + 2600 * Math.pow(bell(t, d), 1.2); }, function () { return 1800; }, function (t) { return Math.pow(bell(t, d), 2); }), gain: 0.5 };
+    },
+    thud: function () {
+      var b = buf(0.26), ph = 0, i, nz = lowNoise(5, 0.26, 450, function (t) { return Math.exp(-t / 0.012) * 0.5; }, 1);
+      for (i = 0; i < b.length; i++) { var t = i / SR, f = 52 + 70 * Math.exp(-t / 0.035); ph += TAU * f / SR; b[i] = Math.sin(ph) * expEnv(t, 0.002, 0.075) + nz[i]; }
+      return { pcm: b, gain: 0.8 };
+    },
+    gasp: function () {
+      var d = 0.24;
+      var b = noiseBand(21, d, function (t) { return 900 + 2400 * clamp(t / 0.15, 0, 1); }, function () { return 1700; }, function (t) { return t < 0.2 ? Math.pow(t / 0.2, 1.4) : Math.max(0, 1 - (t - 0.2) / 0.03); });
+      return { pcm: b, gain: 0.6, keys: [{ t0: 0, t1: d, v: 'O', open: 1.1, ph: 'o' }] };
+    },
+    sniffle: function () {
+      var out = buf(0.62), k, sn = [[0, 1.0, 0.2], [0.27, 0.7, 0.18], [0.5, 0.4, 0.1]];
+      for (k = 0; k < sn.length; k++) {
+        (function (at, g, d) {
+          var hi = noiseBand(30 + k, d, function (t) { return 2000 + 1700 * clamp(t / d, 0, 1); }, function () { return 1500; }, function (t) { return expEnv(t, 0.012, d * 0.35); });
+          var lo = lowNoise(40 + k, d, 600, function (t) { return expEnv(t, 0.02, d * 0.3) * 0.5; }, 2);
+          add(out, hi, at, g); add(out, lo, at, g);
+        })(sn[k][0], sn[k][1], sn[k][2]);
+      }
+      return { pcm: out, gain: 0.95 };
+    },
+    rumble: function () {
+      var d = 1.2, n = Math.round(d * SR), out = new Float32Array(n), a = lowNoise(7, d, 130, function () { return 1; }, 3), b = noiseBand(8, d, function () { return 240; }, function () { return 140; }, function () { return 1; }), i;
+      for (i = 0; i < n; i++) {
+        var t = i / SR, am = 0.5 + 0.5 * Math.sin(TAU * (5 + 2.5 * Math.sin(1.7 * t)) * t), sw = Math.pow(bell(t, d), 0.8);
+        out[i] = (a[i] * 3.2 + b[i] * 0.9) * am * sw;
+      }
+      return { pcm: out, gain: 0.9 };
+    },
+    giggle: function () {
+      var P = [], A = [], F = [], keys = [], k, t0, N = 4, hz, step = 0.118;
+      for (k = 0; k < N; k++) {
+        t0 = 0.03 + k * step; hz = 520 - k * 18;
+        P.push([t0 + 0.02, hz * 1.07], [t0 + 0.088, hz * 0.8]);                                  /* each "he" drops in pitch, each one a little lower */
+        A.push([t0 - 0.006, 0, 0.0], [t0 + 0.004, 0, 0.16], [t0 + 0.026, 0.0, 0.1], [t0 + 0.036, 0.95 * Math.pow(0.86, k), 0.04], [t0 + 0.068, 0.75 * Math.pow(0.86, k), 0.02], [t0 + 0.088, 0, 0]);
+        F.push([t0, 620 + k * 8, 2200, 3050, 110, 130, 190]);
+        keys.push({ t0: t0, t1: t0 + 0.034, v: 'E', open: 0.45, ph: 'h' }, { t0: t0 + 0.034, t1: t0 + 0.09, v: 'E', open: 1.0, ph: 'e' });
+      }
+      var dur = 0.03 + N * step + 0.06;
+      A.unshift([0, 0, 0]); P.unshift([0, P[0][1]]); F.unshift([0, 620, 2200, 3050, 110, 130, 190]);
+      return { pcm: LS().renderCustom({ duration: dur, style: 'excited', styleOverride: { vib: 0, jitter: 0.012, breath: 0.05 }, f0: P, F: F, A: A }), gain: 0.9, keys: keys };
+    },
+    scream: function () {
+      var d = 1.7;
+      var s = LS().renderCustom({
+        duration: d, style: 'shout', styleOverride: { vib: 0.03, vibHz: 7.2, jitter: 0.03, oq: 0.42, tilt: 9000, breath: 0.08 },
+        f0: [[0, 330], [0.06, 650], [0.18, 900], [0.72, 860], [1.1, 790], [1.45, 610], [d, 430]],
+        F: [[0, 700, 1300, 2600, 150, 160, 200], [0.12, 1080, 1680, 2800, 170, 180, 230], [1.4, 1010, 1620, 2800, 170, 180, 230], [d, 820, 1400, 2700, 150, 160, 200]],
+        A: [[0, 0, 0.05], [0.014, 1.0, 0.12], [1.42, 1.0, 0.1], [d - 0.04, 0.0, 0.0]]
+      });
+      var i, am;
+      for (i = 0; i < s.length; i++) { var t = i / SR; am = 1 - 0.28 * clamp((t - 0.35) / 0.4, 0, 1) * (0.5 + 0.5 * Math.sin(TAU * 74 * t)); s[i] *= am; }
+      return { pcm: s, gain: 1.0, keys: [{ t0: 0, t1: d, v: 'A', open: 1.4, ph: 'a' }] };
+    },
+    sob: function () {
+      var P = [[0, 300]], A = [[0, 0, 0]], F = [[0, 400, 1000, 2400, 120, 140, 190]], keys = [], k, t0, N = 3, d = 0.07 + N * 0.44 + 0.1;
+      for (k = 0; k < N; k++) {
+        t0 = 0.05 + k * 0.44;
+        A.push([t0, 0, 0], [t0 + 0.05, 0, 0.32], [t0 + 0.11, 0, 0.1], [t0 + 0.14, 0.7 - k * 0.1, 0.18], [t0 + 0.26, 0.72 - k * 0.1, 0.16], [t0 + 0.36, 0, 0.02], [t0 + 0.38, 0, 0]);
+        P.push([t0 + 0.12, 335 - k * 22], [t0 + 0.36, 245 - k * 22]);
+        F.push([t0 + 0.05, 520, 1450, 2500, 120, 140, 190], [t0 + 0.14, 420, 1050, 2450, 120, 140, 190], [t0 + 0.34, 640, 1350, 2500, 130, 150, 200]);
+        keys.push({ t0: t0 + 0.05, t1: t0 + 0.13, v: 'O', open: 0.6, ph: 'h' }, { t0: t0 + 0.13, t1: t0 + 0.36, v: 'U', open: 0.8, ph: 'u' });
+      }
+      var s = LS().renderCustom({ duration: d, style: 'sob', styleOverride: { vib: 0.035, vibHz: 6.2, jitter: 0.03, breath: 0.16, drop: 0 }, f0: P, F: F, A: A });
+      return { pcm: s, gain: 0.8, keys: keys };
+    },
+    sigh: function () {
+      var d = 0.95;
+      var s = LS().renderCustom({ duration: d, style: 'whisper', f0: [[0, 220], [d, 200]],
+        F: [[0, 700, 1400, 2600, 130, 150, 190], [0.5, 560, 1200, 2500, 130, 150, 190], [d, 420, 1000, 2450, 130, 150, 190]],
+        A: [[0, 0, 0], [0.12, 0, 0.35], [0.45, 0, 0.3], [d - 0.05, 0, 0.0]] });
+      return { pcm: s, gain: 0.55, keys: [{ t0: 0.08, t1: d - 0.1, v: 'O', open: 0.7, ph: 'o' }] };
+    },
+    yawn: function () {
+      var d = 1.6;
+      var s = LS().renderCustom({ duration: d, style: 'soft', styleOverride: { breath: 0.18, vib: 0.01, vibHz: 4.5 }, f0: [[0, 250], [0.5, 310], [1.0, 245], [d, 170]],
+        F: [[0, 700, 1300, 2600, 140, 150, 190], [0.6, 880, 1350, 2700, 150, 160, 200], [1.2, 560, 1000, 2600, 140, 150, 190], [d, 450, 950, 2500, 140, 150, 190]],
+        A: [[0, 0, 0], [0.3, 0.8, 0.2], [1.1, 0.8, 0.18], [d - 0.05, 0, 0]] });
+      return { pcm: s, gain: 0.7, keys: [{ t0: 0.1, t1: 1.0, v: 'A', open: 1.4, ph: 'a' }, { t0: 1.0, t1: d - 0.1, v: 'O', open: 0.9, ph: 'o' }] };
+    },
+    hum: function () {
+      var r = LS().synth('hmm', { rate: 0.62, style: 'soft' });
+      return { pcm: r.pcm, gain: 0.6, keys: [{ t0: 0.05, t1: r.duration - 0.05, v: 'M', open: 0.1, ph: 'm' }] };
+    },
+    oh: function () {
+      var r = LS().synth('oh!', { rate: 0.9, style: 'excited', pitch: 330 });
+      return { pcm: r.pcm, gain: 0.8, keys: L.Lipsync ? L.Lipsync.fromTimeline(r.timeline) : null };
+    },
+    kiss: function () {
+      var r = LS().synth('mwa', { rate: 1.5, style: 'excited', pitch: 340 }), n = r.pcm.length + Math.round(0.08 * SR), out = new Float32Array(n);
+      add(out, r.pcm, 0, 0.9);
+      var click = noiseBand(51, 0.025, function () { return 2600; }, function () { return 1800; }, function (t) { return expEnv(t, 0.001, 0.007); });
+      add(out, click, r.duration - 0.02, 0.8);
+      return { pcm: out, gain: 0.8, keys: [{ t0: 0, t1: 0.1, v: 'U', open: 0.5, ph: 'm' }, { t0: 0.1, t1: r.duration - 0.03, v: 'M', open: 0.1, ph: 'm' }] };
+    }
+  };
+  X.names = Object.keys(MAKERS);
+
+  /* optional automatic sounds for gestures (the stage plays these quietly) */
+  var GESTURE = { spin: 'whoosh', hop: 'boing', sit: 'thud', wave: null, bounce: null };
+  X.forGesture = function (g) { return GESTURE[g] || null; };
+
+  var cache = {};
+  X.make = function (name, opts) {
+    var mk = MAKERS[name];
+    if (!mk || !LS()) return null;
+    if (cache[name] && !(opts && opts.fresh)) return cache[name];
+    var r = mk(), pcm = r.pcm;
+    peakNorm(pcm, 0.85); fadeEdges(pcm, 3);
+    var out = { name: name, pcm: pcm, sampleRate: SR, duration: pcm.length / SR, keys: r.keys || null, gain: r.gain === undefined ? 1 : r.gain };
+    cache[name] = out;
+    return out;
+  };
+  X.clearCache = function () { cache = {}; };
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/voice/voice.js ===== */
+/* Leon Offline — voice.js
+ * One object that makes Leon talk. It chooses the sound source, keeps the mouth in sync, and knows about mute.
+ *
+ *   engines   'device'  the phone's own offline text-to-speech (Android bridge window.LeonNative, or Web Speech API).
+ *                       Natural speech; quality and Filipino support depend on the voices installed on the phone.
+ *             'leon'    Leon's own built-in voice (LeonSynth formant synthesizer). Always available, fully offline,
+ *                       cute and a little robotic.
+ *             'auto'    device voice when the phone has one, otherwise Leon's own voice.
+ *             'off'     no sound at all (Leon still moves his mouth).
+ *             any name you register with registerEngine() (e.g. a Piper or Sherpa-ONNX model you bundle yourself).
+ *
+ *   var voice = Leon.Voice.create({ engine: 'auto' });
+ *   voice.unlock();                                    // once, from a tap / click (browsers block audio before that)
+ *   voice.speak({ voice: 'Hello po, yarn!', style: 'excited' }).then(function (r) { ... });
+ *   every frame: var m = voice.mouth();  avatar.setMouth(m.v, m.open);
+ *   voice.sfx('giggle');  voice.setMuted(true);  voice.stop();
+ *
+ * A "beat" (see engine/brain.js) maps like this:  silent -> no sound, no lips   |   speak:false -> only sfx, no words
+ *   mouth:true -> lips move with no sound (mute drama)   |   style: normal excited whisper shout sob soft
+ * No network. Works in a browser, an Android WebView or (with mocks) Node. */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  var V = L.Voice = {};
+
+  var DEFAULTS = {
+    engine: 'auto',
+    rate: 1, pitch: 1, volume: 1,           /* user preferences, 1 = default */
+    sfx: true,
+    lang: 'fil-PH', voiceName: '',          /* device voice preference */
+    leon: { pitch: 255, formant: 1.10 }     /* LeonSynth tuning: base pitch in Hz, vocal-tract scale */
+  };
+  /* how a style maps onto a plain text-to-speech engine (they cannot whisper or sob, so this is an approximation) */
+  var DEVICE_STYLE = {
+    normal: { rate: 1.00, pitch: 1.25, volume: 1.00 }, excited: { rate: 1.14, pitch: 1.50, volume: 1.00 },
+    whisper: { rate: 0.92, pitch: 1.10, volume: 0.35 }, shout: { rate: 1.00, pitch: 1.50, volume: 1.00 },
+    sob: { rate: 0.80, pitch: 1.05, volume: 0.60 }, soft: { rate: 0.92, pitch: 1.15, volume: 0.70 }
+  };
+  var REST = { v: 'X', open: 0, active: false, ph: '' };
+
+  function clamp(x, a, b) { return x < a ? a : (x > b ? b : x); }
+  function wall() { return (root.performance && root.performance.now ? root.performance.now() : Date.now()) / 1000; }
+  function LP() { return L.Lipsync; }
+  function hasNative() { return !!(root.LeonNative && typeof root.LeonNative.speak === 'function'); }
+  function hasWebSpeech() { return !!(root.speechSynthesis && typeof root.SpeechSynthesisUtterance === 'function'); }
+  function merge(a, b) { var o = {}, k; for (k in a) o[k] = a[k]; if (b) for (k in b) o[k] = (b[k] && typeof b[k] === 'object' && !Array.isArray(b[k]) && a[k] && typeof a[k] === 'object') ? merge(a[k], b[k]) : b[k]; return o; }
+
+  V._instances = [];
+  /* Android calls this (via evaluateJavascript) with the text-to-speech progress: type = start | done | error | range */
+  V.nativeEvent = function (type, id, a, b) { V._instances.forEach(function (v) { v._nativeEvent(type, String(id), a, b); }); };
+  V.availability = function () { return { native: hasNative(), webSpeech: hasWebSpeech(), leon: !!(L.LeonSynth && L.G2P), webAudio: !!(root.AudioContext || root.webkitAudioContext) }; };
+
+  function Voice(opts) {
+    this.o = merge(DEFAULTS, opts);
+    this.muted = false; this.token = 0; this.cur = null; this.ctx = null; this.master = null;
+    this.player = new (LP().Player)(); this.sfxPlayer = new (LP().Player)(); this._clock = 'wall'; this._sfxClock = 'wall';
+    this.engines = {}; this._voices = []; this._nativeId = 0; this._nativeCur = null; this._utt = null; this._sfxEnd = 0;
+    V._instances.push(this);
+    this._loadVoices();
+  }
+  V.create = function (opts) { return new Voice(opts); };
+
+  /* ---------- setup ---------- */
+  Voice.prototype._loadVoices = function () {
+    var self = this, ss = root.speechSynthesis;
+    if (!ss || !ss.getVoices) return;
+    function grab() { try { self._voices = ss.getVoices() || []; } catch (e) { self._voices = []; } }
+    grab();
+    if (ss.addEventListener) ss.addEventListener('voiceschanged', grab); else ss.onvoiceschanged = grab;
+  };
+  Voice.prototype._audio = function () {
+    if (this.ctx && this.ctx.state !== 'closed') return this.ctx;
+    var AC = root.AudioContext || root.webkitAudioContext;
+    if (!AC) return null;
+    try { this.ctx = new AC(); this.master = this.ctx.createGain(); this.master.gain.value = 1; this.master.connect(this.ctx.destination); } catch (e) { this.ctx = null; }
+    return this.ctx;
+  };
+  /* call once from a tap or click: browsers keep audio and speech locked until the user does something */
+  Voice.prototype.unlock = function () {
+    var ctx = this._audio();
+    try {
+      if (ctx) {
+        if (ctx.state === 'suspended' && ctx.resume) ctx.resume();
+        var b = ctx.createBuffer(1, 1, 22050), s = ctx.createBufferSource(); s.buffer = b; s.connect(ctx.destination); s.start(0);
+      }
+      if (hasWebSpeech() && !hasNative()) { var u = new root.SpeechSynthesisUtterance(' '); u.volume = 0; root.speechSynthesis.speak(u); }
+    } catch (e) { /* not fatal */ }
+    return !!ctx;
+  };
+  Voice.prototype.registerEngine = function (name, fn) { this.engines[name] = fn; return this; };
+  Voice.prototype.setOptions = function (o) { this.o = merge(this.o, o); return this; };
+  Voice.prototype.setMuted = function (m) { m = !!m; if (m && !this.muted) { this.stop(); } this.muted = m; return this; };
+  Voice.prototype.isMuted = function () { return this.muted; };
+  Voice.prototype.speaking = function () { return !!this.cur; };
+
+  Voice.prototype.engineName = function () {
+    var e = this.o.engine;
+    if (e === 'off') return 'off';
+    if (this.engines[e]) return e;
+    var leonOk = !!(L.LeonSynth && L.G2P), dev = hasNative() || (hasWebSpeech() && this._voices.length > 0);
+    if (e === 'leon') return leonOk ? 'leon' : (dev ? 'device' : 'off');
+    if (e === 'device') return (hasNative() || hasWebSpeech()) ? 'device' : (leonOk ? 'leon' : 'off');
+    return dev ? 'device' : (leonOk ? 'leon' : 'off');                       /* auto */
+  };
+  Voice.prototype.info = function () {
+    var a = V.availability();
+    return { requested: this.o.engine, active: this.engineName(), native: a.native, webSpeech: a.webSpeech, leon: a.leon, webAudio: a.webAudio, voices: this._voices.length, muted: this.muted, custom: Object.keys(this.engines) };
+  };
+  Voice.prototype.listVoices = function () {
+    return this._voices.map(function (v) { return { name: v.name, lang: v.lang, local: !!v.localService, isDefault: !!v.default }; })
+      .sort(function (a, b) { var fa = /^(fil|tl)/i.test(a.lang) ? 0 : (/^en-PH/i.test(a.lang) ? 1 : 2), fb = /^(fil|tl)/i.test(b.lang) ? 0 : (/^en-PH/i.test(b.lang) ? 1 : 2); return fa - fb || a.name.localeCompare(b.name); });
+  };
+  Voice.prototype._pickVoice = function () {
+    var vs = this._voices, want = this.o.voiceName, i, pref = [String(this.o.lang || 'fil-PH').toLowerCase(), 'fil', 'tl', 'en-ph', 'en-us', 'en'];
+    if (!vs.length) return null;
+    if (want) for (i = 0; i < vs.length; i++) if (vs[i].name === want || vs[i].voiceURI === want) return vs[i];
+    for (var p = 0; p < pref.length; p++) {
+      var cand = vs.filter(function (v) { return String(v.lang).toLowerCase().replace('_', '-').indexOf(pref[p]) === 0; });
+      if (cand.length) { var local = cand.filter(function (v) { return v.localService; }); return (local.length ? local : cand)[0]; }   /* prefer voices that work offline */
+    }
+    return vs[0];
+  };
+
+  /* ---------- speaking ---------- */
+  Voice.prototype.speak = function (beat) {
+    beat = typeof beat === 'string' ? { text: beat } : (beat || {});
+    var self = this, engine = this.engineName();
+    var raw = beat.voice !== undefined && beat.voice !== null ? beat.voice : beat.text;
+    var text = String(raw || '').replace(/\s+/g, ' ').trim(), style = beat.style || 'normal';
+    if (!text || beat.speak === false) return Promise.resolve({ ok: true, engine: 'none' });
+    var sound = !this.muted && engine !== 'off' && !beat.silent;
+    var mouthOnly = !sound && (beat.mouth || (engine === 'off' && !this.muted && !beat.silent));
+    if (!sound && !mouthOnly) return Promise.resolve({ ok: true, engine: 'none' });
+    var tok = ++this.token;
+    this._cancel('interrupted');
+
+    return new Promise(function (resolve) {
+      var ended = false, cleanups = [];
+      var cur = self.cur = { tok: tok, resolve: resolve, cleanup: function () { cleanups.forEach(function (f) { try { f(); } catch (e) { /* ignore */ } }); } };
+      function finish(res) {
+        if (ended) return; ended = true;
+        if (self.cur === cur) { self.cur = null; self.player.stop(); }
+        cur.cleanup(); res = res || {}; if (res.ok === undefined) res.ok = true; resolve(res);
+      }
+      cur.finish = finish;
+      cur.addCleanup = function (f) { cleanups.push(f); };
+      try {
+        if (mouthOnly) self._mouthing(text, style, cur, finish);
+        else if (engine === 'device') self._speakDevice(text, style, cur, finish);
+        else if (engine === 'leon') self._speakLeon(text, style, cur, finish);
+        else if (self.engines[engine]) self._speakCustom(engine, text, style, cur, finish);
+        else self._mouthing(text, style, cur, finish);
+      } catch (e) { finish({ ok: false, error: String(e && e.message || e) }); }
+    });
+  };
+  Voice.prototype._cancel = function (why) {
+    var c = this.cur; this.cur = null;
+    if (c) { this.player.stop(); try { c.cleanup(); } catch (e) { /* ignore */ } c.resolve({ ok: false, cancelled: true, why: why }); }
+  };
+  Voice.prototype.stop = function () {
+    this.token++;
+    this._cancel('stopped');
+    this._stopSfx();
+    try { if (hasWebSpeech()) root.speechSynthesis.cancel(); } catch (e) { /* ignore */ }
+    try { if (hasNative() && root.LeonNative.stopSpeaking) root.LeonNative.stopSpeaking(); } catch (e) { /* ignore */ }
+    this._nativeCur = null;
+  };
+
+  /* lips only: wall clock, no sound */
+  Voice.prototype._mouthing = function (text, style, cur, finish) {
+    var est = LP().estimate(text, { rate: this.o.rate, style: style }), t0 = wall();
+    this._clock = 'wall';
+    this.player.start(est.keys, t0, { scale: 1, words: est.words });
+    var tm = setTimeout(function () { finish({ engine: 'mouth', duration: est.duration }); }, Math.round(est.duration * 1000) + 40);
+    cur.addCleanup(function () { clearTimeout(tm); });
+  };
+
+  /* Leon's own voice */
+  Voice.prototype._speakLeon = function (text, style, cur, finish) {
+    var lv = this.o.leon, r = L.LeonSynth.synth(text, { style: style, pitch: lv.pitch * this.o.pitch, formant: lv.formant, rate: this.o.rate });
+    this._playPcm(r.pcm, r.sampleRate, clamp(this.o.volume, 0, 1.5), LP().fromTimeline(r.timeline), cur, finish, 'leon');
+  };
+  /* a plugged-in engine: fn(text, {style, rate, pitch, lang}) -> {pcm: Float32Array, sampleRate} (or a Promise of it) */
+  Voice.prototype._speakCustom = function (name, text, style, cur, finish) {
+    var self = this, tok = cur.tok;
+    Promise.resolve(this.engines[name](text, { style: style, rate: this.o.rate, pitch: this.o.pitch, lang: this.o.lang })).then(function (r) {
+      if (self.token !== tok || self.cur !== cur) return;
+      if (!r || !r.pcm) { finish({ ok: false, engine: name, error: 'engine returned no audio' }); return; }
+      var dur = r.pcm.length / r.sampleRate, est = LP().estimate(text, { rate: 1, style: style }), sc = dur / Math.max(0.2, est.duration);
+      var keys = est.keys.map(function (k) { return { t0: k.t0 * sc, t1: k.t1 * sc, v: k.v, open: k.open, ph: k.ph }; });
+      self._playPcm(r.pcm, r.sampleRate, clamp(self.o.volume, 0, 1.5), keys, cur, finish, name);
+    }, function (e) { finish({ ok: false, engine: name, error: String(e && e.message || e) }); });
+  };
+  Voice.prototype._playPcm = function (pcm, sr, vol, keys, cur, finish, engine) {
+    var ctx = this._audio(), dur = pcm.length / sr;
+    if (!ctx) {                                                              /* no WebAudio (tests, very old WebView): lips only */
+      this._clock = 'wall'; this.player.start(keys, wall(), { scale: 1 });
+      var tm0 = setTimeout(function () { finish({ engine: engine, duration: dur, silent: true }); }, Math.round(dur * 1000) + 40);
+      cur.addCleanup(function () { clearTimeout(tm0); });
+      return;
+    }
+    if (ctx.state === 'suspended' && ctx.resume) { try { ctx.resume(); } catch (e) { /* ignore */ } }
+    var buf = ctx.createBuffer(1, pcm.length, sr);
+    if (buf.copyToChannel) buf.copyToChannel(pcm, 0); else buf.getChannelData(0).set(pcm);
+    var src = ctx.createBufferSource(), g = ctx.createGain(), startAt = ctx.currentTime + 0.04;
+    src.buffer = buf; g.gain.value = vol; src.connect(g); g.connect(this.master);
+    src.onended = function () { finish({ engine: engine, duration: dur }); };
+    this._clock = 'audio'; this.player.start(keys, startAt, { scale: 1 });
+    src.start(startAt);
+    cur.addCleanup(function () { src.onended = null; try { src.stop(); } catch (e) { /* already stopped */ } try { g.disconnect(); } catch (e2) { /* ignore */ } });
+    var wd = setTimeout(function () { finish({ ok: false, engine: engine, duration: dur, error: 'audio never started (locked?)' }); }, Math.round((dur + 2.5) * 1000));
+    cur.addCleanup(function () { clearTimeout(wd); });
+  };
+
+  /* the phone's text-to-speech */
+  Voice.prototype._deviceParams = function (style) {
+    var d = DEVICE_STYLE[style] || DEVICE_STYLE.normal;
+    return { rate: clamp(d.rate * this.o.rate, 0.5, 2.0), pitch: clamp(d.pitch * this.o.pitch, 0.1, 2.0), volume: clamp(d.volume * this.o.volume, 0, 1) };
+  };
+  Voice.prototype._speakDevice = function (text, style, cur, finish) {
+    var self = this, P = this._deviceParams(style), est = LP().estimate(text, { rate: 1, style: style });
+    var expected = LP().expectedSeconds(text, P.rate), scale = expected / Math.max(0.2, est.duration);
+    this._clock = 'wall';
+    this.player.start(est.keys, wall(), { scale: scale, endless: true, words: est.words });
+    cur.est = est;
+    var wd = setTimeout(function () { finish({ ok: false, engine: 'device', error: 'speech never finished' }); }, Math.round((expected * 2.5 + 3) * 1000));
+    cur.addCleanup(function () { clearTimeout(wd); });
+    var spoke = false;
+    function done(ok) { spoke = true; finish({ ok: ok, engine: 'device', duration: expected }); }
+    cur.addCleanup(function () {                                               /* cancelled before it finished: silence the engine */
+      if (spoke) return;
+      try { if (hasNative()) { if (root.LeonNative.stopSpeaking) root.LeonNative.stopSpeaking(); } else if (hasWebSpeech()) root.speechSynthesis.cancel(); } catch (e) { /* ignore */ }
+    });
+    if (hasNative()) {
+      var id = String(++this._nativeId);
+      this._nativeCur = { id: id, cur: cur, done: done };
+      cur.addCleanup(function () { if (self._nativeCur && self._nativeCur.id === id) self._nativeCur = null; });
+      var lang = this._pickLangForNative();
+      root.LeonNative.speak(id, text, P.rate, P.pitch, P.volume, lang);
+      return;
+    }
+    var ss = root.speechSynthesis, u = new root.SpeechSynthesisUtterance(text), v = this._pickVoice();
+    if (v) { u.voice = v; u.lang = v.lang; } else u.lang = this.o.lang;
+    u.rate = P.rate; u.pitch = P.pitch; u.volume = P.volume;
+    u.onboundary = function (e) { if (!e || (e.name && e.name !== 'word')) return; self._onChar(cur, e.charIndex); };
+    u.onend = function () { done(true); };
+    u.onerror = function (e) { done(!!(e && (e.error === 'canceled' || e.error === 'interrupted'))); };
+    this._utt = u;                                                           /* keep a reference: some engines drop events from collected utterances */
+    cur.addCleanup(function () { if (self._utt === u) { u.onend = null; u.onerror = null; u.onboundary = null; } });
+    try { ss.cancel(); } catch (e0) { /* ignore */ }
+    ss.speak(u);
+  };
+  Voice.prototype._pickLangForNative = function () { return this.o.lang || 'fil-PH'; };
+  Voice.prototype._onChar = function (cur, ci) {
+    if (!cur || this.cur !== cur || !cur.est) return;
+    var ws = cur.est.words, wi = -1, i;
+    for (i = 0; i < ws.length; i++) { if (ws[i].start <= ci) wi = i; else break; }
+    if (wi >= 0) this.player.anchorWord(wi, wall());
+  };
+  Voice.prototype._nativeEvent = function (type, id, a, b) {
+    var nc = this._nativeCur;
+    if (!nc || nc.id !== id) return;
+    if (type === 'range') this._onChar(nc.cur, +a);
+    else if (type === 'done') nc.done(true);
+    else if (type === 'error') nc.done(false);
+  };
+
+  /* ---------- sound effects ---------- */
+  Voice.prototype.sfx = function (name, o) {
+    o = o || {};
+    var self = this;
+    if (this.muted || this.engineName() === 'off' || this.o.sfx === false || !L.Sfx) return Promise.resolve({ ok: false, skipped: true });
+    var s = L.Sfx.make(name);
+    if (!s) return Promise.resolve({ ok: false, error: 'unknown sfx' });
+    var ctx = this._audio(), vol = clamp((o.volume === undefined ? 1 : o.volume) * s.gain * this.o.volume, 0, 1.5);
+    if (!ctx) {
+      if (s.keys && !this.cur) { this._sfxClock = 'wall'; this.sfxPlayer.start(s.keys, wall(), { scale: 1 }); }
+      return new Promise(function (res) { setTimeout(function () { self.sfxPlayer.stop(); res({ ok: true, silent: true }); }, Math.round(s.duration * 1000)); });
+    }
+    if (ctx.state === 'suspended' && ctx.resume) { try { ctx.resume(); } catch (e) { /* ignore */ } }
+    return new Promise(function (resolve) {
+      var buf = ctx.createBuffer(1, s.pcm.length, s.sampleRate);
+      if (buf.copyToChannel) buf.copyToChannel(s.pcm, 0); else buf.getChannelData(0).set(s.pcm);
+      var src = ctx.createBufferSource(), g = ctx.createGain(), at = ctx.currentTime + 0.02;
+      src.buffer = buf; g.gain.value = vol; src.connect(g); g.connect(self.master);
+      var tm = setTimeout(end, Math.round((s.duration + 1.5) * 1000)), done = false;
+      function end() { if (done) return; done = true; clearTimeout(tm); if (self._sfxCur === rec) { self._sfxCur = null; self.sfxPlayer.stop(); } resolve({ ok: true, duration: s.duration }); }
+      var rec = { src: src, g: g, end: end };
+      self._stopSfx(); self._sfxCur = rec;                                      /* replace any effect that is still playing */
+      if (s.keys && !self.cur) { self._sfxClock = 'audio'; self.sfxPlayer.start(s.keys, at, { scale: 1 }); }
+      src.onended = end; src.start(at);
+    });
+  };
+  Voice.prototype._stopSfx = function () {
+    var r = this._sfxCur; this._sfxCur = null; this.sfxPlayer.stop();
+    if (r) { try { r.src.onended = null; r.src.stop(); } catch (e) { /* ignore */ } try { r.g.disconnect(); } catch (e2) { /* ignore */ } try { r.end(); } catch (e3) { /* ignore */ } }
+  };
+
+  /* ---------- per frame ---------- */
+  Voice.prototype.mouth = function () {
+    var m;
+    if (this.player.keys) {
+      m = this.player.mouth(this._clock === 'audio' && this.ctx ? this.ctx.currentTime : wall());
+      if (m.active || m.open > 0.05) return m;
+    }
+    if (this.sfxPlayer.keys) {
+      m = this.sfxPlayer.mouth(this._sfxClock === 'audio' && this.ctx ? this.ctx.currentTime : wall());
+      if (m.active || m.open > 0.05) return m;
+    }
+    return REST;
+  };
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/ui/stage.js ===== */
+/* Leon Offline — stage.js
+ * The beat player. The brain returns "beats"; the stage performs them in order:
+ *   wait (beat.delay) -> face (expr) -> body (gesture) -> sound effect (sfx) -> speech + lip-sync -> reading pause (hold)
+ * It has no DOM of its own: it drives an avatar (Leon.Avatar controller) and a voice (Leon.Voice) and tells the UI what
+ * is happening through events, so it can be tested in Node and reused in the overlay.
+ *
+ *   var stage = new Leon.Stage({ avatar: avatar, voice: voice });
+ *   stage.on('beat', function (beat, info) { showBubble(beat.text, beat.action); });
+ *   stage.play(brain.respond('kumusta'));        // returns a Promise; a new play() interrupts the old one
+ *   stage.start();                               // starts the per-frame mouth sync (rAF)
+ *
+ * events: start(reply)  beat(beat, info)  beatEnd(beat)  idle(reply)  cancel()  error(err) */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+
+  function clamp(x, a, b) { return x < a ? a : (x > b ? b : x); }
+
+  function Stage(opts) {
+    opts = opts || {};
+    this.avatar = opts.avatar || null;
+    this.voice = opts.voice || null;
+    this.gestureSfx = opts.gestureSfx !== false;     /* quiet automatic sounds for gestures (whoosh, boing, thud) */
+    this.readMsPerChar = opts.readMsPerChar === undefined ? 48 : opts.readMsPerChar;   /* how long a line stays up when nothing is spoken */
+    this.readMinMs = opts.readMinMs === undefined ? 800 : opts.readMinMs; this.readMaxMs = opts.readMaxMs || 5000;
+    this.gapMs = opts.gapMs === undefined ? 220 : opts.gapMs;
+    this.token = 0; this.running = false; this.current = null;
+    this._waiters = []; this.h = {}; this._mouthOn = false; this._loop = null; this._lastGestureSfx = 0;
+  }
+  L.Stage = Stage;
+
+  Stage.prototype.on = function (ev, fn) { (this.h[ev] = this.h[ev] || []).push(fn); return this; };
+  Stage.prototype.off = function (ev, fn) { var a = this.h[ev]; if (!a) return this; if (!fn) delete this.h[ev]; else this.h[ev] = a.filter(function (f) { return f !== fn; }); return this; };
+  Stage.prototype._emit = function (ev, a, b) {
+    var a2 = this.h[ev]; if (!a2) return;
+    a2.slice().forEach(function (fn) { try { fn(a, b); } catch (e) { if (root.console) root.console.error('[Leon.Stage] handler error in "' + ev + '":', e); } });
+  };
+
+  Stage.prototype.busy = function () { return this.running; };
+
+  /* reply: the object returned by brain.respond()/tick()/poke() ... or just an array of beats */
+  Stage.prototype.play = function (reply, o) {
+    o = o || {};
+    var beats = Array.isArray(reply) ? reply : ((reply && reply.beats) || []);
+    if (!beats.length) return Promise.resolve({ completed: true, empty: true, played: 0 });
+    if (this.running && o.interrupt === false) return Promise.resolve({ completed: false, dropped: true, played: 0 });
+    this.cancel(true);
+    var self = this, tok = ++this.token;
+    this.running = true;
+    this._emit('start', reply);
+    return this._run(beats, tok).then(function (res) {
+      if (self.token === tok) { self.running = false; self.current = null; self._emit('idle', reply); }
+      return res;
+    });
+  };
+
+  Stage.prototype._run = function (beats, tok) {
+    var self = this, i = 0;
+    return new Promise(function (resolve) {
+      function next() {
+        if (self.token !== tok) { resolve({ completed: false, cancelled: true, played: i }); return; }
+        if (i >= beats.length) { resolve({ completed: true, played: i }); return; }
+        var b = beats[i++], idx = i - 1;
+        self._wait(b.delay || 0).then(function () {
+          if (self.token !== tok) return null;
+          return self._beat(b, tok, idx, beats.length);
+        }).then(next, function (e) { self._emit('error', e); next(); });
+      }
+      next();
+    });
+  };
+
+  Stage.prototype._wait = function (ms) {
+    var self = this;
+    return new Promise(function (resolve) {
+      if (!(ms > 0)) { resolve(); return; }
+      var rec = { resolve: resolve, id: null };
+      rec.id = setTimeout(function () { self._waiters = self._waiters.filter(function (r) { return r !== rec; }); resolve(); }, ms);
+      self._waiters.push(rec);
+    });
+  };
+  Stage.prototype._clearWaits = function () {
+    var w = this._waiters; this._waiters = [];
+    w.forEach(function (r) { clearTimeout(r.id); r.resolve(); });             /* resolve now so the chain notices the cancel */
+  };
+
+  Stage.prototype._beat = function (b, tok, idx, count) {
+    var self = this, av = this.avatar, vo = this.voice, t0 = Date.now(), text = String(b.text || '');
+    this.current = b;
+    if (av) {
+      if (b.expr) { try { av.setExpression(b.expr); } catch (e) { /* unknown expression: keep the current face */ } }
+      if (b.gesture) { try { av.gesture(b.gesture); } catch (e2) { /* ignore */ } }
+    }
+    var readMs = clamp(text.length * this.readMsPerChar, this.readMinMs, this.readMaxMs) + (b.hold || 0);
+    var wantsWords = !!b.voice && b.speak !== false;
+    this._emit('beat', b, { index: idx, count: count, readMs: readMs, speaks: wantsWords && !b.silent });
+
+    var sfxName = b.sfx || null, sfxDur = 0, chain = Promise.resolve();
+    if (!sfxName && b.gesture && this.gestureSfx && L.Sfx && Date.now() - this._lastGestureSfx > 1200) {
+      var gs = L.Sfx.forGesture(b.gesture);
+      if (gs && vo && !vo.isMuted()) { this._lastGestureSfx = Date.now(); try { vo.sfx(gs, { volume: 0.5 }); } catch (e3) { /* ignore */ } }
+    }
+    if (sfxName && vo) {
+      var made = L.Sfx && L.Sfx.make(sfxName);
+      sfxDur = made ? made.duration : 0;
+      var sp = vo.sfx(sfxName);
+      if (!wantsWords || b.silent) chain = sp.then(function () { return null; });                       /* the effect IS the line (scream, sniffle) */
+      else chain = self._wait(Math.min(sfxDur * 700, 900));                                             /* start talking while the giggle fades */
+    }
+    return chain.then(function () {
+      if (self.token !== tok) return null;
+      return vo ? vo.speak(b) : null;
+    }).then(function (res) {
+      if (self.token !== tok) return null;
+      var sounded = res && res.engine && res.engine !== 'none' && res.engine !== 'mouth' && res.ok !== false;
+      var elapsed = Date.now() - t0, extra = sounded ? self.gapMs + (b.hold || 0) : Math.max(0, readMs - elapsed);
+      return self._wait(extra);
+    }).then(function () {
+      if (self.token === tok) self._emit('beatEnd', b);
+      return null;
+    });
+  };
+
+  Stage.prototype.cancel = function (quiet) {
+    var was = this.running;
+    this.token++; this.running = false; this.current = null;
+    this._clearWaits();
+    if (this.voice) { try { this.voice.stop(); } catch (e) { /* ignore */ } }
+    if (this.avatar) { try { this.avatar.setMouth('X'); this.avatar.setSpeaking(0); } catch (e2) { /* ignore */ } }
+    this._mouthOn = false;
+    if (was && !quiet) this._emit('cancel');
+  };
+
+  /* mouth sync: call once per animation frame (start() does this for you) */
+  Stage.prototype.frame = function () {
+    var vo = this.voice, av = this.avatar;
+    if (!vo || !av) return;
+    var m = vo.mouth();
+    if (m.v !== 'X' || m.active) { av.setMouth(m.v, m.open); av.setSpeaking(Math.min(1, m.open / 1.2)); this._mouthOn = true; }
+    else if (this._mouthOn) { av.setMouth('X'); av.setSpeaking(0); this._mouthOn = false; }
+  };
+  Stage.prototype.start = function () {
+    if (this._loop) return this;
+    var self = this, raf = root.requestAnimationFrame;
+    this._loop = { stop: false };
+    var rec = this._loop;
+    (function tick() {
+      if (rec.stop) return;
+      self.frame();
+      rec.id = raf ? raf.call(root, tick) : setTimeout(tick, 16);
+    })();
+    return this;
+  };
+  Stage.prototype.stop = function () {
+    if (this._loop) { this._loop.stop = true; if (this._loop.id && root.cancelAnimationFrame) root.cancelAnimationFrame(this._loop.id); }
+    this._loop = null; return this;
+  };
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;
+
+/* ===== src/ui/companion.js ===== */
+/* Leon Offline — companion.js
+ * The one-call facade: brain + avatar + voice + stage wired together. This is what your app talks to.
+ *
+ *   var leon = Leon.Companion.create({
+ *     container: document.getElementById('leon'),   // the avatar is drawn here (SVG, no image files needed)
+ *     bubble:    document.getElementById('bubble'), // optional: text bubble element (typewriter + .action class)
+ *     config:    { region: 'PH', profanity: 'on' }, // see Leon.Brain.DEFAULTS
+ *     voice:     { engine: 'auto' }                 // see voice.js
+ *   });
+ *   leon.unlock();            // from the first tap / click (browsers keep audio locked until then)
+ *   leon.start();             // greeting
+ *   leon.say('kumusta');      // what the person typed or said
+ *   leon.poke(); leon.mute(); leon.unmute(); leon.quiet();
+ *   leon.on('beat', function (beat) { ... });  // also: user, reply, start, beatEnd, idle, cancel, mute
+ *
+ * Idle behaviour (boredom, dozing off) runs by itself: a 1-second timer asks the brain, and pauses while the page is hidden.
+ * Nothing here uses the network. */
+(function (root) {
+  'use strict';
+  var L = root.Leon = root.Leon || {};
+  var C = L.Companion = {};
+
+  function reducedMotion() { try { return !!(root.matchMedia && root.matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (e) { return false; } }
+
+  /* types text into an element; returns a cancel function. cps = characters per second */
+  C.typeInto = function (el, text, cps) {
+    var i = 0, id = null, n = text.length, step;
+    if (!el) return function () {};
+    if (!cps || reducedMotion() || n < 4) { el.textContent = text; return function () {}; }
+    el.textContent = '';
+    step = Math.max(1, Math.round(cps / 30));
+    id = setInterval(function () { i = Math.min(n, i + step); el.textContent = text.slice(0, i); if (i >= n) { clearInterval(id); id = null; } }, 33);
+    return function () { if (id) { clearInterval(id); id = null; } el.textContent = text; };
+  };
+
+  C.create = function (opts) {
+    opts = opts || {};
+    var storage = opts.storage || L.Util.makeStorage(opts.storagePrefix || 'leon:');
+    var brain = opts.brainInstance || new L.Brain({ config: opts.config, storage: storage, now: opts.now });
+    var ownAvatar = !opts.avatarInstance && !!opts.container && !!L.Avatar;
+    var avatar = opts.avatarInstance || (ownAvatar ? L.Avatar.create(opts.container, opts.avatar || {}) : null);
+    var voice = opts.voiceInstance || L.Voice.create(opts.voice || {});
+    var stage = new L.Stage({ avatar: avatar, voice: voice, gestureSfx: opts.gestureSfx, readMsPerChar: opts.readMsPerChar, readMinMs: opts.readMinMs, gapMs: opts.gapMs });
+    var handlers = {}, bubble = opts.bubble || null, cancelType = null, tickId = null, destroyed = false, self = {};
+
+    function emit(ev, a, b) {
+      (handlers[ev] || []).slice().forEach(function (fn) { try { fn(a, b); } catch (e) { if (root.console) root.console.error('[Leon] handler error in "' + ev + '":', e); } });
+    }
+    self.on = function (ev, fn) { (handlers[ev] = handlers[ev] || []).push(fn); return self; };
+    self.off = function (ev, fn) { if (!fn) delete handlers[ev]; else handlers[ev] = (handlers[ev] || []).filter(function (f) { return f !== fn; }); return self; };
+
+    /* stage events -> bubble + public events */
+    stage.on('beat', function (b, info) {
+      if (bubble) {
+        if (cancelType) cancelType();
+        bubble.classList.toggle('action', !!b.action);
+        bubble.classList.add('show');
+        bubble.setAttribute('data-expr', b.expr || '');
+        cancelType = C.typeInto(bubble, String(b.text || ''), opts.typeCps === undefined ? 60 : opts.typeCps);
+      }
+      emit('beat', b, info);
+    });
+    stage.on('beatEnd', function (b) { emit('beatEnd', b); });
+    stage.on('start', function (r) { emit('start', r); });
+    stage.on('idle', function (r) {
+      brain.touch();                                        /* boredom counts from the end of his last line */
+      emit('idle', r);
+      if (bubble && opts.fadeBubble !== false) { var tok = stage.token; setTimeout(function () { if (stage.token === tok && !stage.running) bubble.classList.remove('show'); }, 4200); }
+    });
+    stage.on('cancel', function () { emit('cancel'); });
+    stage.on('error', function (e) { if (root.console) root.console.error('[Leon] stage error', e); emit('error', e); });
+    stage.start();
+
+    function play(reply, o) { if (!reply) return Promise.resolve(null); emit('reply', reply); return stage.play(reply, o).then(function () { return reply; }); }
+
+    self.brain = brain; self.avatar = avatar; self.voice = voice; self.stage = stage; self.storage = storage;
+    self.unlock = function () { return voice.unlock(); };
+    self.start = function () { return play(brain.start()); };
+    self.say = function (text) {
+      text = String(text === undefined || text === null ? '' : text).trim();
+      if (!text) return Promise.resolve(null);
+      emit('user', text);
+      return play(brain.respond(text));
+    };
+    self.poke = function () { return play(brain.poke()); };
+    self.wake = function () { return play(brain.wake()); };
+    self.quiet = function () { stage.cancel(true); return play(brain.requestQuiet()); };
+    self.mute = function () {
+      if (voice.isMuted()) return Promise.resolve(null);
+      voice.setMuted(true); emit('mute', true);
+      return play(brain.onMute());
+    };
+    self.unmute = function () {
+      if (!voice.isMuted()) return Promise.resolve(null);
+      voice.setMuted(false); emit('mute', false);
+      return play(brain.onUnmute());
+    };
+    self.toggleMute = function () { return voice.isMuted() ? self.unmute() : self.mute(); };
+    self.isMuted = function () { return voice.isMuted(); };
+    self.setConfig = function (partial) { return brain.setConfig(partial); };
+    self.setVoice = function (partial) { voice.setOptions(partial); return voice.info(); };
+    self.resetMemory = function () { brain.resetMemory(); };
+    self.snapshot = function () { return brain.snapshot(); };
+    /* say something in his own voice without going through the brain (e.g. a notification text) */
+    self.speak = function (text, o) { o = o || {}; return play([{ text: text, voice: text, expr: o.expr || 'happy', gesture: o.gesture, style: o.style, sfx: o.sfx }]); };
+    self.setExpression = function (name) { if (avatar) avatar.setExpression(name); };
+    self.stopTalking = function () { stage.cancel(); };
+
+    /* idle life: boredom / dozing. Skips while he is mid-sentence or the page is hidden. */
+    if (opts.idle !== false) {
+      tickId = setInterval(function () {
+        if (destroyed) return;
+        if (root.document && root.document.hidden && !opts.tickWhenHidden) return;
+        if (stage.running) return;
+        var r = brain.tick(opts.now ? opts.now() : Date.now());
+        if (r) play(r, { interrupt: false });
+      }, opts.tickMs || 1000);
+    }
+
+    self.destroy = function () {
+      destroyed = true; if (tickId) clearInterval(tickId);
+      stage.cancel(true); stage.stop(); if (cancelType) cancelType();
+      if (ownAvatar && avatar) avatar.destroy();
+      if (L.host === host) L.host = null;
+    };
+
+    /* hooks for a native shell (Android overlay etc.): Leon.host.say('...'), Leon.host.mute() ... */
+    var host = { say: self.say, poke: self.poke, wake: self.wake, mute: self.mute, unmute: self.unmute, toggleMute: self.toggleMute, quiet: self.quiet,
+      speak: self.speak, setConfig: self.setConfig, setVoice: self.setVoice, unlock: self.unlock, start: self.start, stopTalking: self.stopTalking,
+      snapshot: self.snapshot, companion: self };
+    if (opts.host !== false) L.host = host;
+    return self;
+  };
+})(typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : this));
+;

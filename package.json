@@ -1,0 +1,15 @@
+{
+  "name": "leon-offline",
+  "version": "1.0.0",
+  "description": "Leon the Dino: a fully offline talking companion (brain, animated avatar, own voice). Plain ES5 scripts, no dependencies.",
+  "private": true,
+  "license": "UNLICENSED",
+  "scripts": {
+    "build": "node tools/build.js",
+    "test": "node tests/run_all.js",
+    "icons": "node tools/make_icons.js --android",
+    "lint": "eslint src sw.js tools tests",
+    "sheet": "node tools/render_sheet.js"
+  },
+  "engines": { "node": ">=18" }
+}

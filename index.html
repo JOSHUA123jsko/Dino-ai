@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="fil">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#c9f7e4">
+<meta name="description" content="Leon, the offline talking dino. Everything runs on this device.">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<title>Leon the Dino</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="app">
+  <header class="top">
+    <div class="brand"><span class="dot"></span>Leon <span class="sub">offline</span></div>
+    <div class="top-actions">
+      <button id="btnTranscript" class="icon-btn" type="button" aria-label="Chat history" title="Chat history">💬</button>
+      <button id="btnMute" class="icon-btn" type="button" aria-pressed="false" aria-label="Mute Leon" title="Mute Leon">🔊</button>
+      <button id="btnSettings" class="icon-btn" type="button" aria-label="Settings" title="Settings">⚙️</button>
+    </div>
+  </header>
+
+  <main class="stage-wrap">
+    <div id="bubble" class="bubble" aria-live="polite" role="status"></div>
+    <div id="leon" class="leon" role="button" tabindex="0" aria-label="Leon the dino. Tap to poke him."></div>
+  </main>
+
+  <div class="chips" id="chips" aria-label="Quick messages"></div>
+  <form id="form" class="composer" autocomplete="off">
+    <input id="msg" type="text" inputmode="text" enterkeyhint="send" placeholder="Sabihin mo kay Leon… (type here)" aria-label="Message to Leon" maxlength="400">
+    <button id="mic" class="mic" type="button" hidden aria-label="Talk to Leon">🎤</button>
+    <button id="send" class="send" type="submit">Send</button>
+  </form>
+</div>
+
+<div id="wake" class="wake" role="dialog" aria-modal="true" aria-label="Wake Leon">
+  <div class="wake-card">
+    <div class="wake-emoji" aria-hidden="true">🦖</div>
+    <h1>Leon the Dino</h1>
+    <p>Your talkative math-and-science dino. Everything runs on this device. No internet, no account.</p>
+    <button id="wakeBtn" type="button">Tap to wake Leon</button>
+    <small>Turn your volume up a little. Promise, he'll keep it at 3, yarn.</small>
+  </div>
+</div>
+
+<div id="scrim" class="scrim" hidden></div>
+
+<aside id="transcript" class="sheet" hidden role="dialog" aria-label="Chat history">
+  <div class="sheet-head"><h2>Chat history</h2><button type="button" class="icon-btn close" data-close aria-label="Close">✕</button></div>
+  <ol id="log" class="log"></ol>
+</aside>
+
+<aside id="settings" class="sheet" hidden role="dialog" aria-label="Settings">
+  <div class="sheet-head"><h2>Settings</h2><button type="button" class="icon-btn close" data-close aria-label="Close">✕</button></div>
+  <div class="sheet-body">
+    <section>
+      <h3>Voice</h3>
+      <label>Voice source
+        <select id="sEngine">
+          <option value="auto">Auto (phone voice if it has one, else Leon's own)</option>
+          <option value="device">Phone voice (natural)</option>
+          <option value="leon">Leon's own voice (built in)</option>
+          <option value="off">Silent (he just moves his mouth)</option>
+        </select>
+      </label>
+      <label id="rowVoice" hidden>Phone voice <select id="sVoice"></select></label>
+      <label><span class="lbl">Speed <output id="oRate">1.0</output></span><input id="sRate" type="range" min="0.7" max="1.4" step="0.05" value="1"></label>
+      <label><span class="lbl">Pitch <output id="oPitch">1.0</output></span><input id="sPitch" type="range" min="0.6" max="1.5" step="0.05" value="1"></label>
+      <label><span class="lbl">Volume <output id="oVol">100%</output></span><input id="sVol" type="range" min="0" max="1" step="0.05" value="1"></label>
+      <label class="check"><input id="sSfx" type="checkbox" checked> Sound effects (giggles, sniffles, screams)</label>
+      <button id="bTest" type="button" class="btn">Test his voice</button>
+      <p class="hint" id="voiceInfo"></p>
+    </section>
+    <section>
+      <h3>Personality</h3>
+      <label>"Po / opo" respect
+        <select id="sHonor"><option value="auto">Auto (he follows how you talk)</option><option value="always">Always</option><option value="never">Never</option></select>
+      </label>
+      <label>Curse-word exclamations (putragis, tarantado…)
+        <select id="sProf"><option value="on">On (as seasoning, never as insults)</option><option value="off">Off (kid-safe)</option></select>
+      </label>
+      <label>How much "yarn"
+        <select id="sYarn"><option value="low">Low</option><option value="normal">Normal</option><option value="high">High</option></select>
+      </label>
+      <label>Boredom
+        <select id="sBore"><option value="off">Never gets bored</option><option value="casual">Casual (every few minutes)</option><option value="chill">Chill (rarely)</option><option value="demo">Demo (seconds, for testing)</option></select>
+      </label>
+      <label>Mute-button drama
+        <select id="sMute"><option value="full">Full (confusion, bargaining, tears)</option><option value="short">Short</option><option value="off">Off</option></select>
+      </label>
+      <label class="check"><input id="sAsk" type="checkbox" checked> He may ask (politely) about you: hometown, favorite food…</label>
+      <label>Crisis hotline numbers for
+        <select id="sRegion"><option value="PH">Philippines</option><option value="DEFAULT">Other (no numbers, just kind words)</option></select>
+      </label>
+    </section>
+    <section>
+      <h3>Memory</h3>
+      <p class="hint" id="memInfo"></p>
+      <button id="bForget" type="button" class="btn danger">Forget everything about me</button>
+    </section>
+    <section>
+      <h3>About</h3>
+      <p class="hint">Leon runs fully offline: a small on-device language matcher, a rule-based personality, a built-in voice synthesizer and a procedural avatar. He is not a large AI model, so he may say "hindi ko alam" and that's okay.</p>
+      <p class="hint">If you are ever in danger, call your local emergency number. Leon can share Philippine hotline numbers if you ask him for help.</p>
+    </section>
+  </div>
+</aside>
+
+<script src="leon.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
