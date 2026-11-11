@@ -1,32 +1,215 @@
-name: LEON AI Project Build
+# Builds Leon as an Android app (debug APK).
+# Your repo has no Android project (no gradlew / build.gradle), so this workflow
+# generates a tiny WebView app around Leon's web files while it builds.
+name: Build Android APK
 
 on:
-push:
-branches: [main]
-workflow_dispatch:
+  push:
+  workflow_dispatch:
 
 permissions:
-contents: read
+  contents: read
 
 jobs:
-build-leon:
-runs-on: ubuntu-latest
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Project
+        uses: actions/checkout@v7
 
-steps:
-  - name: Checkout Repository
-    uses: actions/checkout@v4
+      - name: Set Up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
 
-  - name: Setup Node.js
-    uses: actions/setup-node@v4
-    with:
-      node-version: 20
+      - name: Set Up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.14.3'
+          cache-provider: basic
 
-  - name: Build Leon
-    run: node tools/build.js --no-android
+      - name: Build APK
+        run: |
+          set -euo pipefail
 
-  - name: Upload Leon Build
-    uses: actions/upload-artifact@v4
-    with:
-      name: LEON-AI-Build
-      path: dist/
-      if-no-files-found: error
+          # 1) Find Leon's web files (top level or inside a folder)
+          WEB="$(find . -type d -path '*/android/app/src/main/assets/leon' -not -path './.git/*' | head -n 1 || true)"
+          if [ -z "$WEB" ]; then
+            WEB="$(find . -type d -path '*/dist/web' -not -path './.git/*' | head -n 1 || true)"
+          fi
+
+          # 2) Not found? Maybe the repo only holds the zip/7z - unpack it
+          if [ -z "$WEB" ]; then
+            ARCHIVE="$(find . -type f \( -iname '*.zip' -o -iname '*.7z' -o -iname '*_zip' \) -not -path './.git/*' | head -n 1 || true)"
+            if [ -n "$ARCHIVE" ]; then
+              echo "Unpacking $ARCHIVE"
+              command -v 7z >/dev/null || sudo apt-get install -y p7zip-full
+              mkdir -p "$RUNNER_TEMP/unpacked"
+              7z x -y -o"$RUNNER_TEMP/unpacked" "$ARCHIVE" >/dev/null
+              WEB="$(find "$RUNNER_TEMP/unpacked" -type d -path '*/android/app/src/main/assets/leon' | head -n 1 || true)"
+              if [ -z "$WEB" ]; then
+                WEB="$(find "$RUNNER_TEMP/unpacked" -type d -path '*/dist/web' | head -n 1 || true)"
+              fi
+            fi
+          fi
+
+          if [ -z "$WEB" ] || [ ! -f "$WEB/index.html" ]; then
+            echo "::error::Leon's web files (index.html + leon.js) were not found in this repo. Upload the unpacked project folder and run again."
+            exit 1
+          fi
+          echo "Using Leon's web files from: $WEB"
+
+          # 3) Generate a minimal Android project (WebView) in a temp folder
+          B="$RUNNER_TEMP/leon-apk"
+          mkdir -p "$B/src/main/java/com/leon/offline" "$B/src/main/assets"
+          cp -r "$WEB" "$B/src/main/assets/leon"
+
+          ICON=""
+          if [ -f "$WEB/icons/icon-192.png" ]; then
+            mkdir -p "$B/src/main/res/mipmap-xxxhdpi"
+            cp "$WEB/icons/icon-192.png" "$B/src/main/res/mipmap-xxxhdpi/ic_launcher.png"
+            ICON='android:icon="@mipmap/ic_launcher"'
+          fi
+
+          cat > "$B/settings.gradle.kts" <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "leon"
+          EOF
+
+          cat > "$B/build.gradle.kts" <<'EOF'
+          plugins {
+              id("com.android.application") version "8.13.2"
+          }
+
+          android {
+              namespace = "com.leon.offline"
+              compileSdk = 36
+
+              defaultConfig {
+                  applicationId = "com.leon.offline"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+          }
+          EOF
+
+          cat > "$B/gradle.properties" <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          EOF
+
+          cat > "$B/src/main/AndroidManifest.xml" <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="Leon"
+                  $ICON
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout|uiMode"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter> </activity>
+              </application> </manifest>
+          EOF
+
+          cat > "$B/src/main/java/com/leon/offline/MainActivity.java" <<'EOF'
+          package com.leon.offline;
+
+          import android.annotation.SuppressLint;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          public class MainActivity extends Activity {
+              private WebView web;
+
+              @SuppressLint("SetJavaScriptEnabled")
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  web = new WebView(this);
+                  setContentView(web);
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setMediaPlaybackRequiresUserGesture(false);
+                  web.setWebViewClient(new WebViewClient());
+                  web.setWebChromeClient(new WebChromeClient());
+                  web.loadUrl("file:///android_asset/leon/index.html");
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (web != null && web.canGoBack()) {
+                      web.goBack();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  if (web != null) web.onPause();
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  if (web != null) web.onResume();
+              }
+
+              @Override
+              protected void onDestroy() {
+                  if (web != null) web.destroy();
+                  super.onDestroy();
+              }
+          }
+          EOF
+
+          # 4) Build the debug APK (signed with the automatic debug key, installable right away)
+          cd "$B"
+          gradle assembleDebug
+
+          APK="$(find "$B/build/outputs/apk/debug" -name '*.apk' | head -n 1 || true)"
+          if [ -z "$APK" ]; then
+            echo "::error::Gradle finished but no APK was produced."
+            exit 1
+          fi
+          cp "$APK" "$GITHUB_WORKSPACE/Leon-debug.apk"
+          ls -lh "$GITHUB_WORKSPACE/Leon-debug.apk"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          path: Leon-debug.apk
+          archive: false
+          if-no-files-found: error
