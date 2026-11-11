@@ -28,7 +28,9 @@ jobs:
         uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: '8.14.3'
-          cache-provider: basic
+          # The Gradle project is generated during the build, so the repo has no
+          # Gradle files to build a cache key from. Caching stays off.
+          cache-disabled: true
 
       - name: Build APK
         run: |
